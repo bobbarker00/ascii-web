@@ -18,7 +18,13 @@
 // Usage:
 //   ascii-browse <url> [--cell 8] [--threshold 0.08] [--fps 10]
 //                      [--mono] [--gray] [--invert] [--no-text] [--hidpi]
-//                      [--braille] [--sound] [--once]
+//                      [--braille] [--pixels auto|kitty|sixel|off]
+//                      [--sound] [--once]
+//
+// --pixels: render <img>/<video>/<canvas> regions as true pixels via the
+//           kitty graphics protocol or sixel where the terminal supports it
+//           (auto-detected; ASCII/braille remains the fallback and fills
+//           everything else). 'p' toggles at runtime.
 //
 // --invert  flips the fill ramp ("paper mode"): right for mostly-white sites.
 // --no-text disables the DOM text overlay (pure art mode).
@@ -53,7 +59,7 @@ const argv = process.argv.slice(2);
 const opt = {
   cell: 8, threshold: 0.08, fps: 10,
   mono: false, gray: false, invert: false, noText: false, hidpi: false,
-  braille: false, sound: false, once: false
+  braille: false, sound: false, once: false, pixels: 'auto'
 };
 let url = null;
 for (let i = 0; i < argv.length; i++) {
@@ -66,6 +72,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--braille') opt.braille = true;
   else if (a === '--sound') opt.sound = true;
   else if (a === '--once') opt.once = true;
+  else if (a === '--pixels') opt.pixels = argv[++i] || 'auto';
   else if (a === '--cell') opt.cell = Math.max(2, Math.min(12, +argv[++i] || 8));
   else if (a === '--threshold') opt.threshold = +argv[++i] || 0.08;
   else if (a === '--fps') opt.fps = Math.max(1, Math.min(30, +argv[++i] || 10));
@@ -144,7 +151,9 @@ async function quit(code) {
   if (quitting) return;
   quitting = true;
   if (!opt.once) {
-    // colours, mouse reporting off, cursor, main screen
+    // kitty images, colours, mouse reporting off, cursor, main screen
+    try { if (pixelMode === 'kitty') process.stdout.write('\x1b_Ga=d,d=A\x1b\\'); }
+    catch (e) { /* quit before pixel detection ran */ }
     process.stdout.write('\x1b[0m\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l');
     if (process.stdin.isTTY) process.stdin.setRawMode(false);
     process.stdin.pause();
@@ -180,6 +189,50 @@ for (const f of PIPELINE_FILES) {
 }
 await rendererPage.evaluate(() => {
   window.__r = new window.__AsciiWeb.AsciiRenderer(); // throws if WebGL2 missing
+
+  // Sixel encoder (fixed 6x6x6 palette, RLE). Lives in the renderer tab so
+  // the heavy per-pixel work happens in the browser process, not our loop.
+  window.__sixel = function (d, w, h) {
+    const idx = new Uint8Array(w * h);
+    for (let p = 0, q = 0; p < w * h; p++, q += 4) {
+      idx[p] = Math.round(d[q] / 51) * 36 + Math.round(d[q + 1] / 51) * 6 + Math.round(d[q + 2] / 51);
+    }
+    let out = '\x1bP0;1;0q"1;1;' + w + ';' + h;
+    for (let i = 0; i < 216; i++) {
+      out += '#' + i + ';2;' + (((i / 36 | 0) % 6) * 20) + ';' + (((i / 6 | 0) % 6) * 20) + ';' + ((i % 6) * 20);
+    }
+    for (let y0 = 0; y0 < h; y0 += 6) {
+      const bandH = Math.min(6, h - y0);
+      const masks = new Map(); // colour -> per-column dot bitmask
+      for (let dy = 0; dy < bandH; dy++) {
+        const base = (y0 + dy) * w;
+        for (let x = 0; x < w; x++) {
+          const ci = idx[base + x];
+          let m = masks.get(ci);
+          if (!m) { m = new Uint8Array(w); masks.set(ci, m); }
+          m[x] |= 1 << dy;
+        }
+      }
+      let firstColor = true;
+      for (const [ci, m] of masks) {
+        out += (firstColor ? '' : '$') + '#' + ci;
+        firstColor = false;
+        let prev = -1, run = 0;
+        for (let x = 0; x <= w; x++) {
+          const bits = x < w ? m[x] : -1;
+          if (bits === prev) { run++; continue; }
+          if (run > 0) {
+            const ch = String.fromCharCode(63 + prev);
+            out += run > 3 ? '!' + run + ch : ch.repeat(run);
+          }
+          prev = bits;
+          run = 1;
+        }
+      }
+      out += '-';
+    }
+    return out + '\x1b\\';
+  };
 });
 // Keep the page tab frontmost: background tabs get rAF throttled to ~1fps,
 // which crawls every animation on the page. The renderer tab doesn't care —
@@ -224,9 +277,10 @@ page.on('framenavigated', (fr) => {
 // ASCII mode: one shader cell per terminal cell (aspect 2).
 // Braille mode: square subcells at half the cell width — a terminal cell
 // covers exactly 2x4 of them, one per braille dot.
-async function convert(b64) {
+async function convert(b64, scroll) {
   const braille = opt.braille;
-  const f = await rendererPage.evaluate(async (b64, cell, threshold, invert, braille) => {
+  const mediaReq = mediaGeometry(scroll); // null unless true-pixel mode is active
+  const f = await rendererPage.evaluate(async (b64, cell, threshold, invert, braille, mediaReq) => {
     const blob = await (await fetch('data:image/jpeg;base64,' + b64)).blob();
     // flipY baked in: WebGL ignores UNPACK_FLIP_Y for ImageBitmap sources.
     const bmp = await createImageBitmap(blob, { imageOrientation: 'flipY' });
@@ -246,14 +300,38 @@ async function convert(b64) {
       }
       return btoa(bin);
     };
+
+    // True-pixel crops: cut each media box out of an *unflipped* decode of
+    // the same frame; kitty gets PNG base64, sixel gets the escape string.
+    let media = null;
+    if (mediaReq) {
+      media = [];
+      const up = await createImageBitmap(blob);
+      for (const b of mediaReq.boxes) {
+        const oc = new OffscreenCanvas(b.outW || b.sw, b.outH || b.sh);
+        const ctx = oc.getContext('2d');
+        ctx.drawImage(up, b.sx, b.sy, b.sw, b.sh, 0, 0, oc.width, oc.height);
+        let data;
+        if (mediaReq.mode === 'kitty') {
+          const png = new Uint8Array(await (await oc.convertToBlob({ type: 'image/png' })).arrayBuffer());
+          data = b64ify(png);
+        } else {
+          data = window.__sixel(ctx.getImageData(0, 0, oc.width, oc.height).data, oc.width, oc.height);
+        }
+        media.push({ col: b.col, row: b.row, cols: b.cols, rows: b.rows, mode: mediaReq.mode, data: data });
+      }
+      up.close();
+    }
+
     return {
       cols: g.cols,
       rows: g.rows,
       text: g.text,
       colors: b64ify(g.colors),
-      glyphs: braille ? b64ify(g.glyphs) : null
+      glyphs: braille ? b64ify(g.glyphs) : null,
+      media: media
     };
-  }, b64, CW * DSF, opt.threshold, opt.invert, braille);
+  }, b64, CW * DSF, opt.threshold, opt.invert, braille, mediaReq);
   if (f) f.braille = braille; // pin the mode used, in case 'b' toggles mid-frame
   return f;
 }
@@ -263,7 +341,24 @@ async function convert(b64) {
 // group words into visual lines (clustered by y-centre). Runs ~1/s (positions
 // are document-relative, so scrolling doesn't invalidate them).
 let textLines = []; // [{ y, words: [...x-sorted] }], sorted by y
+let mediaBoxes = []; // visible <img>/<video>/<canvas> rects, document CSS px
 let lastExtract = 0;
+
+async function extractMedia() {
+  mediaBoxes = await page.evaluate(() => {
+    const out = [];
+    document.querySelectorAll('img, video, canvas').forEach((el) => {
+      const r = el.getBoundingClientRect();
+      if (r.width < 40 || r.height < 40) return;
+      if (r.bottom < 0 || r.top > innerHeight || r.right < 0 || r.left > innerWidth) return;
+      const cs = getComputedStyle(el);
+      if (cs.visibility === 'hidden' || cs.display === 'none') return;
+      out.push({ x: r.left + scrollX, y: r.top + scrollY, w: r.width, h: r.height });
+    });
+    // biggest first; the per-frame cap keeps the payload sane
+    return out.sort((a, b) => b.w * b.h - a.w * a.h).slice(0, 4);
+  }).catch(() => mediaBoxes);
+}
 
 async function extractText() {
   const raw = await page.evaluate(() => {
@@ -528,6 +623,19 @@ function composeFrame(f, scroll) {
   const colors = cells.colors;
   const overrides = new Map(); // cellIndex -> [r,g,b] from CSS text colour
 
+  // Cells under a true-pixel image go blank: kitty draws at z=-1 beneath the
+  // text layer (spaces reveal it, words/hints still stamp on top), and sixel
+  // paints over them after the text writes.
+  if (f.media) {
+    for (const m of f.media) {
+      for (let y = m.row; y < Math.min(m.row + m.rows, cells.rows); y++) {
+        for (let x = m.col; x < Math.min(m.col + m.cols, cells.cols); x++) {
+          chars[y][x] = ' ';
+        }
+      }
+    }
+  }
+
   if (!opt.noText) {
     // Line-level mapping: each visual text line claims one terminal row.
     // Lines are processed top-to-bottom; when two lines prefer the same row
@@ -606,7 +714,12 @@ function composeFrame(f, scroll) {
   for (let y = 0; y < height; y++) {
     let line = '';
     if (opt.colorMode === 'mono') {
-      line = chars[y].join('');
+      // Unstyled page content — but hint labels are UI, not content, so
+      // they keep a highlight (reverse video needs no colour support).
+      for (let x = 0; x < cells.cols; x++) {
+        const ov = overrides.get(y * cells.cols + x);
+        line += ov && ov.hint ? '\x1b[7m' + chars[y][x] + '\x1b[0m' : chars[y][x];
+      }
     } else {
       const gray = opt.colorMode === 'gray';
       const grayOf = (v) => {
@@ -658,7 +771,8 @@ function draw(f, scroll) {
     let help;
     if (mode === 'insert') help = ' -- INSERT -- keys go to the page · Esc back ';
     else if (mode === 'hint') help = ' -- LINKS ' + hintPrefix + ' -- type a label · Esc cancel ';
-    else help = ' | q quit · o url · f links · e type · H/L hist · c colour · t/i/b ';
+    else help = ' | q quit · o url · f links · e type · H/L hist · c colour · t/i/b' +
+      (pixelMode ? '/p' : '') + ' ';
     status = '\x1b[7m ' + url.slice(0, Math.max(10, grid.cols - help.length - 2)) +
       help + '\x1b[0m';
   }
@@ -676,17 +790,116 @@ function draw(f, scroll) {
   }
   prevRows = rowsOut;
   prevStatus = status;
+
+  // True-pixel media: kitty placements persist, so clear the previous set
+  // and retransmit whenever we redraw; sixel just repaints at the cursor.
+  if (f.media && f.media.length) {
+    if (f.media[0].mode === 'kitty') out += '\x1b_Ga=d,d=A\x1b\\';
+    out += emitMedia(f.media);
+    hadKittyMedia = f.media[0].mode === 'kitty';
+  } else if (hadKittyMedia) {
+    out += '\x1b_Ga=d,d=A\x1b\\'; // media scrolled away/toggled off
+    hadKittyMedia = false;
+  }
+
   if (out) process.stdout.write(out);
+}
+let hadKittyMedia = false;
+
+// ---- true-pixel media -----------------------------------------------------------
+// Probe the terminal (before the key handler attaches — responses arrive on
+// stdin): kitty graphics query, DA1 for sixel capability, cell pixel size.
+let pixelMode = null;          // 'kitty' | 'sixel' | null
+let pixelsOn = true;           // runtime toggle ('p')
+let cellPx = { w: 8, h: 16 };  // physical pixels per terminal cell (sixel scaling)
+
+if (!opt.once && process.stdin.isTTY && opt.pixels !== 'off') {
+  process.stdin.setRawMode(true);
+  process.stdin.resume();
+  const resp = await new Promise((resolve) => {
+    let acc = '';
+    const done = () => { process.stdin.off('data', on); resolve(acc); };
+    const timer = setTimeout(done, 400);
+    const on = (d) => {
+      acc += d.toString('latin1');
+      if (/\x1b\[\?[\d;]*c/.test(acc)) { clearTimeout(timer); done(); } // DA1 = last reply
+    };
+    process.stdin.on('data', on);
+    process.stdout.write('\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[16t\x1b[c');
+  });
+  const da = /\x1b\[\?([\d;]*)c/.exec(resp);
+  if (opt.pixels === 'kitty' || (opt.pixels === 'auto' && resp.includes('\x1b_Gi=31'))) {
+    pixelMode = 'kitty';
+  } else if (opt.pixels === 'sixel' || (opt.pixels === 'auto' && da && da[1].split(';').includes('4'))) {
+    pixelMode = 'sixel';
+  }
+  const cs = /\x1b\[6;(\d+);(\d+)t/.exec(resp);
+  if (cs && +cs[1] > 0 && +cs[2] > 0) cellPx = { h: +cs[1], w: +cs[2] };
+} else if (opt.pixels === 'kitty' || opt.pixels === 'sixel') {
+  pixelMode = opt.pixels; // forced (also usable with --once / no TTY)
+}
+
+// Map visible media boxes to cell-aligned crop requests for the renderer tab.
+function mediaGeometry(scroll) {
+  if (!pixelMode || !pixelsOn || !mediaBoxes.length) return null;
+  const list = [];
+  const VW = grid.cols * CW;
+  const VH = grid.rows * CH;
+  for (const b of mediaBoxes) {
+    const x0 = Math.max(b.x - scroll.sx, 0);
+    const y0 = Math.max(b.y - scroll.sy, 0);
+    const x1 = Math.min(b.x - scroll.sx + b.w, VW);
+    const y1 = Math.min(b.y - scroll.sy + b.h, VH);
+    const col = Math.round(x0 / CW);
+    const row = Math.round(y0 / CH);
+    const cols = Math.floor((x1 - x0) / CW);
+    const rows = Math.floor((y1 - y0) / CH);
+    if (cols < 2 || rows < 1) continue;
+    list.push({
+      col, row, cols, rows,
+      sx: col * CW * DSF, sy: row * CH * DSF,
+      sw: cols * CW * DSF, sh: rows * CH * DSF,
+      // sixel paints physical pixels, so scale crops to the cell box exactly
+      outW: pixelMode === 'sixel' ? cols * cellPx.w : 0,
+      outH: pixelMode === 'sixel' ? rows * cellPx.h : 0
+    });
+  }
+  return list.length ? { mode: pixelMode, boxes: list } : null;
+}
+
+// Serialize one frame's media as terminal graphics escapes.
+function emitMedia(media) {
+  let out = '';
+  for (let i = 0; i < media.length; i++) {
+    const m = media[i];
+    out += '\x1b7\x1b[' + (m.row + 1) + ';' + (m.col + 1) + 'H'; // save cursor, move
+    if (m.mode === 'kitty') {
+      const id = 40 + i;
+      for (let p = 0; p < m.data.length; p += 4096) {
+        const last = p + 4096 >= m.data.length;
+        const ctrl = p === 0
+          ? 'a=T,i=' + id + ',q=2,f=100,z=-1,c=' + m.cols + ',r=' + m.rows + ',m=' + (last ? 0 : 1)
+          : 'q=2,m=' + (last ? 0 : 1);
+        out += '\x1b_G' + ctrl + ';' + m.data.slice(p, p + 4096) + '\x1b\\';
+      }
+    } else {
+      out += m.data; // pre-encoded sixel
+    }
+    out += '\x1b8'; // restore cursor
+  }
+  return out;
 }
 
 // ---- --once: single frame to stdout, no TTY needed ----------------------------
 if (opt.once) {
   if (!opt.noText) await extractText();
-  const b64 = await page.screenshot({ type: 'jpeg', quality: 90, encoding: 'base64' });
-  const f = await convert(b64);
-  if (!f) { console.error('render failed'); await quit(1); }
+  if (pixelMode) await extractMedia();
   const scroll = await page.evaluate(() => ({ sx: scrollX, sy: scrollY }));
+  const b64 = await page.screenshot({ type: 'jpeg', quality: 90, encoding: 'base64' });
+  const f = await convert(b64, scroll);
+  if (!f) { console.error('render failed'); await quit(1); }
   process.stdout.write(composeFrame(f, scroll).join('\n') + '\n');
+  if (f.media && f.media.length) process.stdout.write(emitMedia(f.media));
   await quit(0);
 }
 
@@ -793,6 +1006,7 @@ if (process.stdin.isTTY) {
       opt.colorMode = order[(order.indexOf(opt.colorMode) + 1) % order.length];
       redraw();
     }
+    else if (s === 'p' && pixelMode) { pixelsOn = !pixelsOn; redraw(); }
     else if (s === 'H') page.goBack().catch(() => {});
     else if (s === 'L') page.goForward().catch(() => {});
     else if (s === 't') { opt.noText = !opt.noText; setTextHidden(!opt.noText); redraw(); }
@@ -828,10 +1042,9 @@ while (!quitting) {
     if (b64 !== lastShot || force) {
       lastShot = b64;
       force = false;
-      const [f, scroll] = await Promise.all([
-        convert(b64),
-        page.evaluate(() => ({ sx: scrollX, sy: scrollY }))
-      ]);
+      // Scroll first: media crop geometry depends on it.
+      const scroll = await page.evaluate(() => ({ sx: scrollX, sy: scrollY }));
+      const f = await convert(b64, scroll);
       if (f && !quitting) draw(f, scroll);
     }
   } catch (e) {
@@ -840,9 +1053,10 @@ while (!quitting) {
   // Insert mode refreshes faster so typed field values show promptly — and
   // must force the redraw itself: the page's own text is transparent in the
   // capture, so typing never trips the screenshot change-detector.
-  if (!opt.noText && Date.now() - lastExtract > (mode === 'insert' ? 250 : 1000)) {
+  if (Date.now() - lastExtract > (mode === 'insert' ? 250 : 1000)) {
     lastExtract = Date.now();
-    extractText().then(() => { if (mode === 'insert') redraw(); });
+    if (!opt.noText) extractText().then(() => { if (mode === 'insert') redraw(); });
+    if (pixelMode && pixelsOn) extractMedia();
   }
   await sleep(Math.max(20, 1000 / opt.fps - (Date.now() - t0)));
 }
