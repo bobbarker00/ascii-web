@@ -30,18 +30,33 @@
   const bitmapCache = new Map(); // url -> Promise<ImageBitmap|null>
   const BITMAP_CACHE_MAX = 64;
 
+  // Get raw image bytes: try a direct fetch first (works for same-origin and
+  // CORS-enabled hosts, straight from HTTP cache), fall back to the background
+  // worker for everything else. Resolves to a Blob or null.
+  function fetchBytes(url) {
+    return fetch(url, { credentials: 'omit' })
+      .then((r) => {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.blob();
+      })
+      .catch(
+        () =>
+          new Promise((resolve) => {
+            chrome.runtime.sendMessage({ type: 'ascii-fetch-image', url: url }, (resp) => {
+              if (chrome.runtime.lastError || !resp || !resp.ok) return resolve(null);
+              fetch(resp.dataUrl).then((r) => r.blob()).then(resolve, () => resolve(null));
+            });
+          })
+      );
+  }
+
   function fetchBitmap(url) {
     if (bitmapCache.has(url)) return bitmapCache.get(url);
-    const p = new Promise((resolve) => {
-      chrome.runtime.sendMessage({ type: 'ascii-fetch-image', url: url }, (resp) => {
-        if (chrome.runtime.lastError || !resp || !resp.ok) return resolve(null);
-        fetch(resp.dataUrl)
-          .then((r) => r.blob())
-          // flipY here: WebGL ignores UNPACK_FLIP_Y for ImageBitmap sources,
-          // so the flip is baked in to match the renderer's upload convention.
-          .then((blob) => createImageBitmap(blob, { imageOrientation: 'flipY' }))
-          .then(resolve, () => resolve(null));
-      });
+    const p = fetchBytes(url).then((blob) => {
+      if (!blob) return null;
+      // flipY here: WebGL ignores UNPACK_FLIP_Y for ImageBitmap sources,
+      // so the flip is baked in to match the renderer's upload convention.
+      return createImageBitmap(blob, { imageOrientation: 'flipY' }).catch(() => null);
     });
     if (bitmapCache.size >= BITMAP_CACHE_MAX) {
       const oldest = bitmapCache.keys().next().value;
@@ -70,6 +85,8 @@
     this.isVideo = el.tagName === 'VIDEO';
     this.raf = 0;
     this.lastSize = '';
+    this.animating = false; // true once an ImageDecoder loop owns this canvas
+    this.decoder = null;
 
     const c = document.createElement('canvas');
     c.style.position = 'absolute';
@@ -111,12 +128,14 @@
   Overlay.prototype.renderImage = function () {
     const r = getRenderer();
     if (!r) return;
+    if (this.animating) return; // the animation loop owns the canvas
     if (!this.el.complete || this.el.naturalWidth === 0) {
       this.el.addEventListener('load', () => this.renderImage(), { once: true });
       return;
     }
     const ok = r.render(this.el, this.canvas.width, this.canvas.height, this.ctx, settings);
     if (!ok) this.renderFetched();
+    this.maybeAnimate();
   };
 
   // Fallback when the direct upload tainted: render from a background-fetched
@@ -130,6 +149,73 @@
       const r = getRenderer();
       if (r) r.render(bmp, this.canvas.width, this.canvas.height, this.ctx, settings);
     });
+  };
+
+  // Animated images (GIF/APNG/animated WebP). Uploading an animated <img> to
+  // WebGL always yields the *first frame* (that's per spec, not a bug), so to
+  // animate we must decode the file ourselves: fetch the bytes, run them
+  // through WebCodecs' ImageDecoder, and drive frames like a video.
+  const ANIMATED_EXT = /\.(gif|apng|webp)$/i;
+
+  Overlay.prototype.maybeAnimate = function () {
+    if (this.animating || typeof ImageDecoder === 'undefined') return;
+    const url = this.el.currentSrc || this.el.src;
+    if (!url || !/^https?:/i.test(url)) return;
+    let path;
+    try { path = new URL(url).pathname; } catch (e) { return; }
+    if (!ANIMATED_EXT.test(path)) return;
+
+    this.animating = true; // reserve now; released if the file turns out static
+    fetchBytes(url)
+      .then((blob) => {
+        if (!blob || !overlays.has(this.el)) throw new Error('gone');
+        if ((this.el.currentSrc || this.el.src) !== url) throw new Error('src changed');
+        return blob.arrayBuffer().then((buf) => {
+          const decoder = new ImageDecoder({ data: buf, type: blob.type || 'image/gif' });
+          return decoder.tracks.ready.then(() => {
+            const track = decoder.tracks.selectedTrack;
+            if (!track || track.frameCount <= 1) {
+              decoder.close();
+              throw new Error('static');
+            }
+            this.decoder = decoder;
+            this.animate(decoder, track);
+          });
+        });
+      })
+      .catch(() => { this.animating = false; });
+  };
+
+  Overlay.prototype.animate = function (decoder, track) {
+    let index = 0;
+    let nextAt = 0;
+    let busy = false;
+    const step = () => {
+      if (!overlays.has(this.el)) return; // torn down; destroy() closes the decoder
+      this.raf = requestAnimationFrame(step);
+      const now = performance.now();
+      if (busy || now < nextAt) return;
+      busy = true;
+      decoder
+        .decode({ frameIndex: index })
+        .then((res) => {
+          const frame = res.image;
+          let ms = (frame.duration || 0) / 1000; // duration is in microseconds
+          if (ms < 20) ms = 100; // GIF convention: near-zero delay means ~10fps
+          nextAt = now + ms;
+          index = (index + 1) % track.frameCount;
+          // Through ImageBitmap for the same reason as fetchBitmap: bakes in
+          // the vertical flip that UNPACK_FLIP_Y won't apply to this source.
+          return createImageBitmap(frame, { imageOrientation: 'flipY' }).then((bmp) => {
+            frame.close();
+            const r = getRenderer();
+            if (r) r.render(bmp, this.canvas.width, this.canvas.height, this.ctx, settings);
+            bmp.close();
+          });
+        })
+        .then(() => { busy = false; }, () => { busy = false; });
+    };
+    this.raf = requestAnimationFrame(step);
   };
 
   Overlay.prototype.loop = function () {
@@ -152,6 +238,10 @@
 
   Overlay.prototype.destroy = function () {
     if (this.raf) cancelAnimationFrame(this.raf);
+    if (this.decoder) {
+      try { this.decoder.close(); } catch (e) { /* already closed */ }
+      this.decoder = null;
+    }
     this.canvas.remove();
   };
 

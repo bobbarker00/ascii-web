@@ -53,6 +53,15 @@
     </figure>
 
     <figure>
+      <img width="256" height="256" alt="animated GIF"
+           src="https://upload.wikimedia.org/wikipedia/commons/2/2c/Rotating_earth_%28large%29.gif" />
+      <figcaption><b>Animated GIF</b> (cross-origin, Wikimedia): should convert
+        <em>and keep spinning</em>, west-to-east like the real Earth. Static
+        ASCII &rarr; ImageDecoder path failed; spinning backwards/upside-down
+        &rarr; frame orientation bug.</figcaption>
+    </figure>
+
+    <figure>
       <img id="corsNo" width="256" height="256" alt="cross-origin, no CORS"
            src="https://picsum.photos/id/237/256/256" />
       <figcaption><b>Cross-origin, no CORS:</b> should <em>also</em> convert —

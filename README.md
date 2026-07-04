@@ -88,6 +88,11 @@ Load Temporary Add-on → pick `manifest.json`.
 - **Aggregate cost**: the aggregate shader loops over every pixel in a cell
   (capped at 24x24). Fine for normal pages; expensive for huge full-screen video
   at tiny cell sizes.
+- **Animated images** (GIF/APNG/animated WebP) are re-decoded with WebCodecs'
+  `ImageDecoder` — WebGL uploads from an animated `<img>` only ever see the
+  first frame, per spec. Files are found by extension, so an animated image
+  served from an extensionless URL stays static; browsers without
+  `ImageDecoder` (Firefox) fall back to a static first frame.
 - No overlay for CSS background images, `<canvas>`, or WebGL game canvases yet.
 
 ## Next steps (good tasks to hand to Claude Code)
