@@ -249,9 +249,10 @@ async function convert(b64) {
 }
 
 // ---- DOM text layer -----------------------------------------------------------
-// Extract every visible word with its document position and CSS colour. Runs
-// ~1/s (positions are document-relative, so scrolling doesn't invalidate them).
-let words = [];
+// Extract every visible word with its document position and CSS colour, then
+// group words into visual lines (clustered by y-centre). Runs ~1/s (positions
+// are document-relative, so scrolling doesn't invalidate them).
+let textLines = []; // [{ y, words: [...x-sorted] }], sorted by y
 let lastExtract = 0;
 
 async function extractText() {
@@ -297,7 +298,23 @@ async function extractText() {
       w.c = w.c.map((v) => Math.round(v + (255 - v) * 0.75));
     }
   }
-  words = raw;
+
+  // Cluster into visual lines: words whose y-centres are within ~half a cell
+  // belong to the same line (side-by-side columns merge into one row-line,
+  // which is fine — they occupy different column ranges).
+  raw.sort((a, b) => a.y - b.y || a.x - b.x);
+  const lines = [];
+  let cur = null;
+  for (const w of raw) {
+    if (!cur || Math.abs(w.y - cur.y) > CH * 0.6) {
+      cur = { y: w.y, words: [w] };
+      lines.push(cur);
+    } else {
+      cur.words.push(w);
+    }
+  }
+  for (const ln of lines) ln.words.sort((a, b) => a.x - b.x);
+  textLines = lines;
 }
 
 // ---- drawing ------------------------------------------------------------------
@@ -356,28 +373,40 @@ function composeFrame(f, scroll) {
   const overrides = new Map(); // cellIndex -> [r,g,b] from CSS text colour
 
   if (!opt.noText) {
-    // Words arrive in DOM (~reading) order; a per-row cursor stops adjacent
-    // words overwriting each other when pixel positions round into the same
-    // cells, and guarantees a one-cell gap between them.
-    const cursor = new Int32Array(cells.rows);
-    for (const w of words) {
-      const row = Math.floor((w.y - scroll.sy) / CH);
-      if (row < 0 || row >= cells.rows) continue;
-      const ideal = Math.round((w.x - scroll.sx) / CW);
-      const col = Math.max(ideal, cursor[row]);
-      if (col >= cells.cols) continue;
-      // If collisions would shove the word far from its true position (two
-      // DOM lines mapping onto one terminal row), drop it rather than smear
-      // unrelated text together.
-      if (col - ideal > 8) continue;
-      if (col - 1 >= cursor[row]) chars[row][col - 1] = ' '; // pad before
-      for (let i = 0; i < w.t.length && col + i < cells.cols; i++) {
-        chars[row][col + i] = w.t[i];
-        overrides.set(row * cells.cols + col + i, w);
+    // Line-level mapping: each visual text line claims one terminal row.
+    // Lines are processed top-to-bottom; when two lines prefer the same row
+    // (line-height tighter than a cell), the later one shifts down a row —
+    // it's only dropped when even that would displace it more than one row.
+    // Within a line, words can't collide beyond rounding, so the column
+    // cursor only guards a one-cell gap.
+    let lastRow = -1;
+    for (const ln of textLines) {
+      const preferred = Math.floor((ln.y - scroll.sy) / CH);
+      const row = Math.max(preferred, lastRow + 1);
+      if (row < 0 || row >= cells.rows || row - preferred > 1) {
+        if (preferred > lastRow) lastRow = preferred; // keep monotonic on drops
+        continue;
       }
-      const gap = col + w.t.length;
-      if (gap < cells.cols) chars[row][gap] = ' '; // blank the separator cell
-      cursor[row] = gap + 1;
+      lastRow = row;
+      // Within a line, words flow: each sits at its true column when free,
+      // else directly after its predecessor. Pages usually pack more chars
+      // per width than the terminal has cells, so lines may run long — they
+      // truncate at the right edge (losing a tail beats dropping words from
+      // the middle of a sentence).
+      let cursor = 0;
+      for (const w of ln.words) {
+        const ideal = Math.round((w.x - scroll.sx) / CW);
+        const col = Math.max(ideal, cursor);
+        if (col >= cells.cols) continue;
+        if (col - 1 >= cursor && col - 1 >= 0) chars[row][col - 1] = ' '; // pad before
+        for (let i = 0; i < w.t.length && col + i < cells.cols; i++) {
+          chars[row][col + i] = w.t[i];
+          overrides.set(row * cells.cols + col + i, w);
+        }
+        const gap = col + w.t.length;
+        if (gap < cells.cols) chars[row][gap] = ' '; // blank the separator cell
+        cursor = gap + 1;
+      }
     }
   }
 
