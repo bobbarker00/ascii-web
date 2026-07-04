@@ -32,18 +32,19 @@ void main() {
   // thresholds. The result is a thin binary mask along contours, independent of
   // local contrast — this is what gives AcerolaFX its clean line art.
   //
-  // Tuning: SIGMA1 sets line scale (bigger = only larger features outline);
-  // DOG_THRESH sets sensitivity (lower = more lines).
+  // Tuning (now runtime uniforms — popup sliders in the extension, --sigma /
+  // --dog-thresh in the CLI): u_sigma sets line scale (bigger = only larger
+  // features outline); u_dogThresh sets sensitivity (lower = more lines).
   const BLURX_FRAG = `#version 300 es
 precision highp float;
 in vec2 v_uv;
 out vec4 frag;
 uniform sampler2D u_src;
 uniform vec2 u_texel;          // 1.0 / resolution
+uniform float u_sigma;         // narrow Gaussian; the wide one is 1.6x
+uniform int u_radius;          // taps each side, ~3 * wide sigma, <= MAX_R
 
-const float SIGMA1 = 1.2;
-const float SIGMA2 = 1.92;     // 1.6 * SIGMA1
-const int   RADIUS = 6;        // ~3 * SIGMA2
+const int MAX_R = 12;
 
 float lum(vec2 uv) {
   vec3 c = texture(u_src, uv).rgb;
@@ -51,12 +52,15 @@ float lum(vec2 uv) {
 }
 
 void main() {
+  float s1 = u_sigma;
+  float s2 = u_sigma * 1.6;
   vec2 sum = vec2(0.0);
   vec2 wsum = vec2(0.0);
-  for (int i = -RADIUS; i <= RADIUS; i++) {
+  for (int i = -MAX_R; i <= MAX_R; i++) {
+    if (i < -u_radius || i > u_radius) continue;
     float x = float(i);
-    vec2 w = exp(vec2(-x * x / (2.0 * SIGMA1 * SIGMA1),
-                      -x * x / (2.0 * SIGMA2 * SIGMA2)));
+    vec2 w = exp(vec2(-x * x / (2.0 * s1 * s1),
+                      -x * x / (2.0 * s2 * s2)));
     sum += w * lum(v_uv + vec2(u_texel.x * x, 0.0));
     wsum += w;
   }
@@ -69,19 +73,22 @@ in vec2 v_uv;
 out vec4 frag;
 uniform sampler2D u_src;       // RG = horizontally blurred (narrow, wide)
 uniform vec2 u_texel;
+uniform float u_sigma;
+uniform int u_radius;
+uniform float u_dogThresh;     // DoG response needed to count as a line
 
-const float SIGMA1 = 1.2;
-const float SIGMA2 = 1.92;
-const int   RADIUS = 6;
-const float DOG_THRESH = 0.015; // DoG response needed to count as a line
+const int MAX_R = 12;
 
 void main() {
+  float s1 = u_sigma;
+  float s2 = u_sigma * 1.6;
   vec2 sum = vec2(0.0);
   vec2 wsum = vec2(0.0);
-  for (int i = -RADIUS; i <= RADIUS; i++) {
+  for (int i = -MAX_R; i <= MAX_R; i++) {
+    if (i < -u_radius || i > u_radius) continue;
     float y = float(i);
-    vec2 w = exp(vec2(-y * y / (2.0 * SIGMA1 * SIGMA1),
-                      -y * y / (2.0 * SIGMA2 * SIGMA2)));
+    vec2 w = exp(vec2(-y * y / (2.0 * s1 * s1),
+                      -y * y / (2.0 * s2 * s2)));
     sum += w * texture(u_src, v_uv + vec2(0.0, u_texel.y * y)).rg;
     wsum += w;
   }
@@ -90,7 +97,7 @@ void main() {
   // One-sided threshold (per AcerolaFX), not |d|: responds on the bright side
   // of a contour, which keeps lines single rather than doubled.
   float d = b.x - b.y;
-  float mask = (d >= DOG_THRESH) ? 1.0 : 0.0;
+  float mask = (d >= u_dogThresh) ? 1.0 : 0.0;
 
   // G carries the raw (biased) DoG for eyeballing in a debugger; only R is
   // consumed downstream.

@@ -16,10 +16,15 @@
 //   - the merged grid is written as ANSI truecolor frames
 //
 // Usage:
-//   ascii-browse <url> [--cell 8] [--threshold 0.08] [--fps 10]
+//   ascii-browse <url> [--cell 8] [--threshold 0.08] [--sigma 1.2]
+//                      [--dog-thresh 0.015] [--fps 10]
 //                      [--mono] [--gray] [--invert] [--no-text] [--hidpi]
 //                      [--braille] [--pixels auto|kitty|sixel|off]
 //                      [--sound] [--once]
+//
+// --sigma / --dog-thresh: DoG edge tuning (same knobs as the extension's
+//   "Line scale" / "Line sensitivity" sliders). Bigger sigma = only larger
+//   features get outlines; lower threshold = more lines.
 //
 // --pixels: render <img>/<video>/<canvas> regions as true pixels via the
 //           kitty graphics protocol or sixel where the terminal supports it
@@ -60,7 +65,7 @@ const PIPELINE_FILES = ['glyph-atlas.js', 'shaders.js', 'ascii-renderer.js'];
 // ---- args -------------------------------------------------------------------
 const argv = process.argv.slice(2);
 const opt = {
-  cell: 8, threshold: 0.08, fps: 10,
+  cell: 8, threshold: 0.08, sigma: 1.2, dogThresh: 0.015, fps: 10,
   mono: false, gray: false, invert: false, noText: false, hidpi: false,
   braille: false, sound: false, once: false, pixels: 'auto'
 };
@@ -78,6 +83,8 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--pixels') opt.pixels = argv[++i] || 'auto';
   else if (a === '--cell') opt.cell = Math.max(2, Math.min(12, +argv[++i] || 8));
   else if (a === '--threshold') opt.threshold = +argv[++i] || 0.08;
+  else if (a === '--sigma') opt.sigma = Math.max(0.4, Math.min(4, +argv[++i] || 1.2));
+  else if (a === '--dog-thresh') opt.dogThresh = +argv[++i] || 0.015;
   else if (a === '--fps') opt.fps = Math.max(1, Math.min(30, +argv[++i] || 10));
   else if (!a.startsWith('-') && !url) url = a;
   else {
@@ -311,7 +318,7 @@ page.on('framenavigated', (fr) => {
 async function convert(b64, scroll) {
   const braille = opt.braille;
   const mediaReq = mediaGeometry(scroll); // null unless true-pixel mode is active
-  const f = await rendererPage.evaluate(async (b64, cell, threshold, invert, braille, mediaReq) => {
+  const f = await rendererPage.evaluate(async (b64, cell, threshold, invert, braille, mediaReq, dog) => {
     const blob = await (await fetch('data:image/jpeg;base64,' + b64)).blob();
     // flipY baked in: WebGL ignores UNPACK_FLIP_Y for ImageBitmap sources.
     const bmp = await createImageBitmap(blob, { imageOrientation: 'flipY' });
@@ -319,7 +326,9 @@ async function convert(b64, scroll) {
       cellSize: braille ? cell / 2 : cell,
       cellAspect: braille ? 1 : 2,
       edgeThreshold: threshold,
-      invert: invert
+      invert: invert,
+      dogSigma: dog.sigma,
+      dogThresh: dog.thresh
     });
     bmp.close();
     if (!g) return null;
@@ -362,7 +371,9 @@ async function convert(b64, scroll) {
       glyphs: braille ? b64ify(g.glyphs) : null,
       media: media
     };
-  }, b64, CW * DSF, opt.threshold, opt.invert, braille, mediaReq);
+  }, b64, CW * DSF, opt.threshold, opt.invert, braille, mediaReq,
+  // sigma is in source pixels, so it scales with capture density like cellSize
+  { sigma: opt.sigma * DSF, thresh: opt.dogThresh });
   if (f) f.braille = braille; // pin the mode used, in case 'b' toggles mid-frame
   return f;
 }

@@ -15,7 +15,9 @@
     cellSize: 8,
     color: false,
     edgeThreshold: 0.08,
-    textMode: false
+    textMode: false,
+    dogSigma: 1.2,
+    dogThresh: 0.015
   };
 
   const MIN_SIZE = 64;       // ignore tiny icons/sprites

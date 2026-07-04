@@ -162,6 +162,12 @@
     }
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
 
+    // DoG tuning, runtime-adjustable (popup sliders / CLI flags). Defaults
+    // match the old shader constants.
+    const sigma = Math.max(0.4, Math.min(4, +opts.dogSigma || 1.2));
+    const radius = Math.max(1, Math.min(12, Math.ceil(sigma * 1.6 * 3)));
+    const dogThresh = (opts.dogThresh != null && !isNaN(+opts.dogThresh)) ? +opts.dogThresh : 0.015;
+
     // ---- Pass 1: horizontal blur (both sigmas) -> blurFBO ----
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.blurFBO.fbo);
     gl.viewport(0, 0, outW, outH);
@@ -170,6 +176,8 @@
     gl.bindTexture(gl.TEXTURE_2D, this.srcTex);
     gl.uniform1i(gl.getUniformLocation(this.pBlurX, 'u_src'), 0);
     gl.uniform2f(gl.getUniformLocation(this.pBlurX, 'u_texel'), 1 / outW, 1 / outH);
+    gl.uniform1f(gl.getUniformLocation(this.pBlurX, 'u_sigma'), sigma);
+    gl.uniform1i(gl.getUniformLocation(this.pBlurX, 'u_radius'), radius);
     this._drawQuad();
 
     // ---- Pass 2: vertical blur + DoG threshold -> dogFBO ----
@@ -179,6 +187,9 @@
     gl.bindTexture(gl.TEXTURE_2D, this.blurFBO.tex);
     gl.uniform1i(gl.getUniformLocation(this.pBlurY, 'u_src'), 0);
     gl.uniform2f(gl.getUniformLocation(this.pBlurY, 'u_texel'), 1 / outW, 1 / outH);
+    gl.uniform1f(gl.getUniformLocation(this.pBlurY, 'u_sigma'), sigma);
+    gl.uniform1i(gl.getUniformLocation(this.pBlurY, 'u_radius'), radius);
+    gl.uniform1f(gl.getUniformLocation(this.pBlurY, 'u_dogThresh'), dogThresh);
     this._drawQuad();
 
     // ---- Pass 3: Sobel on the DoG mask -> edgeFBO ----

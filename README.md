@@ -62,6 +62,30 @@ For **Firefox**: change `manifest.json`'s `action` key to `browser_action` (or
 use a Firefox-specific manifest), then load via `about:debugging` → This Firefox →
 Load Temporary Add-on → pick `manifest.json`.
 
+## Install (terminal browser)
+
+The CLI needs Node.js 18+, a Chrome/Chromium binary, and `npm install` once in
+`cli/`. Optional extras: **Xvfb** for `--sound` (invisible display so audio
+stays in-terminal) and a **kitty-protocol or sixel terminal** for true-pixel
+media (`--pixels`; kitty, ghostty, WezTerm, Konsole speak kitty; foot and
+xterm speak sixel — GNOME Terminal and Alacritty support neither).
+
+```bash
+# Fedora / RHEL
+sudo dnf install nodejs chromium xorg-x11-server-Xvfb kitty
+
+# Debian / Ubuntu
+sudo apt install nodejs npm chromium xvfb kitty
+#   (older Ubuntu: the package may be chromium-browser; Google Chrome works too)
+
+# Arch
+sudo pacman -S nodejs npm chromium xorg-server-xvfb kitty
+
+# then, from the repo root:
+cd cli && npm install && cd ..
+node cli/ascii-browse.mjs https://en.wikipedia.org/wiki/ASCII_art
+```
+
 ## Tuning
 
 - **Cell size** — pixels per character. 4 = fine and dense, 16 = chunky and fast.
@@ -69,9 +93,10 @@ Load Temporary Add-on → pick `manifest.json`.
   overrides the fill glyph. Lower = more outlines.
 - **Colour** — off = green-on-black monochrome (set in `ascii-renderer.js` via
   `u_fg`/`u_bg`); on = each glyph tinted by its cell's average colour.
-- **DoG constants** — `SIGMA1`/`SIGMA2`/`DOG_THRESH` at the top of the blur
-  shaders in `shaders.js`. Bigger sigma = only larger features get outlines;
-  lower threshold = more lines.
+- **Line scale / Line sensitivity** — the DoG edge tuning, adjustable live:
+  popup sliders in the extension, `--sigma` / `--dog-thresh` in the CLI.
+  Bigger scale = only larger features get outlines; lower sensitivity value =
+  more lines. (Defaults: 1.2 / 0.015.)
 - **Text mode** — overlays become real, selectable `<pre>` characters
   (monochrome) instead of a canvas, using ~1:2 cells to match monospace glyph
   shape. Under the hood this is `renderer.readCells()`, which returns the cell
