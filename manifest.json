@@ -4,6 +4,10 @@
   "version": "0.1.0",
   "description": "Renders images and videos on any page as live ASCII art using a WebGL2 shader pipeline.",
   "permissions": ["storage", "activeTab"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "src/background.js"
+  },
   "action": {
     "default_popup": "popup.html",
     "default_title": "ASCII Web"

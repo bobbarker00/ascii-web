@@ -22,6 +22,36 @@
   let renderer = null;       // lazily created shared AsciiRenderer
   const overlays = new Map(); // element -> Overlay
 
+  // ---- cross-origin image fallback ----
+  // Non-CORS images taint the direct WebGL upload, so we ask the background
+  // service worker (which has host_permissions) for the bytes and decode them
+  // to an ImageBitmap ourselves. Cached by URL and bounded so image-heavy
+  // pages (Google Images...) don't hoard hundreds of decoded bitmaps.
+  const bitmapCache = new Map(); // url -> Promise<ImageBitmap|null>
+  const BITMAP_CACHE_MAX = 64;
+
+  function fetchBitmap(url) {
+    if (bitmapCache.has(url)) return bitmapCache.get(url);
+    const p = new Promise((resolve) => {
+      chrome.runtime.sendMessage({ type: 'ascii-fetch-image', url: url }, (resp) => {
+        if (chrome.runtime.lastError || !resp || !resp.ok) return resolve(null);
+        fetch(resp.dataUrl)
+          .then((r) => r.blob())
+          // flipY here: WebGL ignores UNPACK_FLIP_Y for ImageBitmap sources,
+          // so the flip is baked in to match the renderer's upload convention.
+          .then((blob) => createImageBitmap(blob, { imageOrientation: 'flipY' }))
+          .then(resolve, () => resolve(null));
+      });
+    });
+    if (bitmapCache.size >= BITMAP_CACHE_MAX) {
+      const oldest = bitmapCache.keys().next().value;
+      bitmapCache.get(oldest).then((b) => { if (b) b.close(); });
+      bitmapCache.delete(oldest);
+    }
+    bitmapCache.set(url, p);
+    return p;
+  }
+
   function getRenderer() {
     if (!renderer) {
       try {
@@ -85,7 +115,21 @@
       this.el.addEventListener('load', () => this.renderImage(), { once: true });
       return;
     }
-    r.render(this.el, this.canvas.width, this.canvas.height, this.ctx, settings);
+    const ok = r.render(this.el, this.canvas.width, this.canvas.height, this.ctx, settings);
+    if (!ok) this.renderFetched();
+  };
+
+  // Fallback when the direct upload tainted: render from a background-fetched
+  // ImageBitmap instead of the element itself.
+  Overlay.prototype.renderFetched = function () {
+    const url = this.el.currentSrc || this.el.src;
+    if (!url || !/^https?:/i.test(url)) return;
+    fetchBitmap(url).then((bmp) => {
+      if (!bmp || !overlays.has(this.el)) return;          // torn down mid-fetch
+      if ((this.el.currentSrc || this.el.src) !== url) return; // src swapped mid-fetch
+      const r = getRenderer();
+      if (r) r.render(bmp, this.canvas.width, this.canvas.height, this.ctx, settings);
+    });
   };
 
   Overlay.prototype.loop = function () {

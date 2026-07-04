@@ -55,9 +55,11 @@
     <figure>
       <img id="corsNo" width="256" height="256" alt="cross-origin, no CORS"
            src="https://picsum.photos/id/237/256/256" />
-      <figcaption><b>Cross-origin, no CORS:</b> should stay a normal photo
-        (silently skipped) and log <code>[ASCII Web] skipped, upload threw
-        SecurityError</code> once in the console.</figcaption>
+      <figcaption><b>Cross-origin, no CORS:</b> should <em>also</em> convert —
+        the direct upload taints (one <code>[ASCII Web] skipped</code> log in
+        the console), then the background-fetch fallback kicks in. Must be
+        upright, not mirrored: this tile is what verifies the ImageBitmap flip
+        convention.</figcaption>
     </figure>
 
     <figure>

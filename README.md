@@ -43,6 +43,7 @@ four edge glyphs. The shader navigates it by index.
 | `src/shaders.js` | All GLSL. The actual ASCII algorithm lives here. |
 | `src/ascii-renderer.js` | One shared WebGL2 context: compiles programs, manages framebuffers, runs the five passes, blits the result. |
 | `src/content.js` | Orchestrator: finds media, manages positioned canvas overlays, drives the per-video render loop, reads settings. |
+| `src/background.js` | MV3 service worker: fetches cross-origin image bytes on request (extension fetches bypass page CORS via `host_permissions`). |
 | `popup.html` / `popup.js` | Toggle + cell size / edge strength / colour controls. Writes to `chrome.storage.local`; the content script reacts live. |
 | `test/index.html` | Self-contained test page (orientation, diagonals, live video, CORS cases). Serve with `python3 -m http.server 8123 -d test`, don't open via `file://`. |
 
@@ -78,10 +79,12 @@ Load Temporary Add-on → pick `manifest.json`.
   `UNPACK_FLIP_Y` convention. If a browser/driver ever disagrees, the one-line
   fixes are the dir values in `EDGE_FRAG` and the flip handling in
   `ascii-renderer.js`. `test/index.html` has the test patterns.
-- **Cross-origin media**: images/videos served without CORS taint the upload
-  and are skipped (`render()` returns false, with a one-time console.debug per
-  element). Confirmed against Google Images and YouTube thumbnails. Fixable
-  with `host_permissions` + a background fetch — see "Next steps".
+- **Cross-origin video**: non-CORS cross-origin *images* work — when the direct
+  upload taints, the content script asks the background service worker to fetch
+  the bytes (extension fetches bypass page CORS) and renders the decoded
+  ImageBitmap instead. Cross-origin *videos* are streams, can't be re-fetched
+  that way, and are still skipped (`render()` returns false, with a one-time
+  console.debug per element).
 - **Aggregate cost**: the aggregate shader loops over every pixel in a cell
   (capped at 24x24). Fine for normal pages; expensive for huge full-screen video
   at tiny cell sizes.
@@ -89,9 +92,6 @@ Load Temporary Add-on → pick `manifest.json`.
 
 ## Next steps (good tasks to hand to Claude Code)
 
-- Fix cross-origin media: add `host_permissions`, fetch the image bytes from
-  extension-privileged code (`fetch` → `createImageBitmap`), and upload that
-  instead of the tainting element. Covers YouTube/Google Images thumbnails.
 - Add a "text mode" output that reads back the per-cell glyph indices and emits a
   real, selectable `<pre>` of characters instead of a canvas.
 - Replace the per-cell pixel loop in the aggregate pass with mipmap sampling for
