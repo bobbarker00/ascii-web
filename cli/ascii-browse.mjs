@@ -27,9 +27,9 @@
 //           8x the spatial detail of one ASCII glyph); the DOM text layer
 //           still stamps normal readable characters on top. Trades the ASCII
 //           aesthetic for detail.
-// --sound   launches a real (visible) Chrome window instead of headless and
-//           doesn't mute it — minimize the window and audio plays normally.
-//           (Headless Chrome has no audio output path.)
+// --sound   (experimental, parked) launches a real (visible) Chrome window
+//           instead of headless and doesn't mute it — minimize the window
+//           and audio plays normally. (Headless Chrome has no audio path.)
 // --once    renders a single frame to stdout and exits (no TTY needed).
 //
 // Keys: q quit · mouse click = click the page · wheel/↑↓/PgUp/PgDn/space
@@ -244,8 +244,13 @@ async function extractText() {
       if (!el) continue;
       const cs = getComputedStyle(el);
       if (cs.visibility === 'hidden' || cs.display === 'none' || +cs.opacity === 0) continue;
+      if (parseFloat(cs.fontSize) < 7) continue; // sub-legible fine print: skip
       const m2 = /rgba?\((\d+),\s*(\d+),\s*(\d+)/.exec(cs.color);
       const col = m2 ? [+m2[1], +m2[2], +m2[3]] : [220, 220, 220];
+      // Styling cues the terminal can reproduce: bold for headings/bold text,
+      // underline for links (otherwise nothing looks clickable).
+      const bold = +cs.fontWeight >= 600 || parseFloat(cs.fontSize) >= 20 ? 1 : 0;
+      const link = el.closest('a[href]') ? 1 : 0;
       const re = /\S+/g;
       let m;
       while ((m = re.exec(s))) {
@@ -253,7 +258,7 @@ async function extractText() {
         range.setEnd(node, m.index + m[0].length);
         const r = range.getBoundingClientRect();
         if (r.width === 0 || r.height === 0) continue;
-        out.push({ t: m[0], x: r.left + scrollX, y: r.top + scrollY + r.height / 2, c: col });
+        out.push({ t: m[0], x: r.left + scrollX, y: r.top + scrollY + r.height / 2, c: col, b: bold, u: link });
         if (out.length >= 8000) return out; // safety cap on huge pages
       }
     }
@@ -288,6 +293,9 @@ function cellsFromAscii(f) {
 // the glyph index the pipeline chose for the subcell: edge glyphs are always
 // ink, fill glyphs by ramp position. Cell colour = average of its 8 subcells.
 const BRAILLE_BITS = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]]; // [y][x]
+// Ordered (Bayer) dither thresholds per dot position: midtones become dot
+// texture instead of being crushed to solid/empty by a single 0.5 cut.
+const BRAILLE_DITHER = [[0.5, 8.5], [12.5, 4.5], [3.5, 11.5], [15.5, 7.5]]; // /16, [y][x]
 
 function cellsFromBraille(f) {
   const cols = f.cols >> 1;
@@ -305,7 +313,7 @@ function cellsFromBraille(f) {
           const si = (y * 4 + sy) * f.cols + (x * 2 + sx);
           const gi = glyphs[si];
           const ink = gi >= atlasInfo.edgeBase ? 1 : gi / (atlasInfo.fillCount - 1);
-          if (ink >= 0.5) bits |= BRAILLE_BITS[sy][sx];
+          if (ink >= BRAILLE_DITHER[sy][sx] / 16) bits |= BRAILLE_BITS[sy][sx];
           r += sub[si * 3]; g += sub[si * 3 + 1]; b += sub[si * 3 + 2];
         }
       }
@@ -332,11 +340,17 @@ function composeFrame(f, scroll) {
     for (const w of words) {
       const row = Math.floor((w.y - scroll.sy) / CH);
       if (row < 0 || row >= cells.rows) continue;
-      const col = Math.max(Math.round((w.x - scroll.sx) / CW), cursor[row]);
+      const ideal = Math.round((w.x - scroll.sx) / CW);
+      const col = Math.max(ideal, cursor[row]);
       if (col >= cells.cols) continue;
+      // If collisions would shove the word far from its true position (two
+      // DOM lines mapping onto one terminal row), drop it rather than smear
+      // unrelated text together.
+      if (col - ideal > 8) continue;
+      if (col - 1 >= cursor[row]) chars[row][col - 1] = ' '; // pad before
       for (let i = 0; i < w.t.length && col + i < cells.cols; i++) {
         chars[row][col + i] = w.t[i];
-        overrides.set(row * cells.cols + col + i, w.c);
+        overrides.set(row * cells.cols + col + i, w);
       }
       const gap = col + w.t.length;
       if (gap < cells.cols) chars[row][gap] = ' '; // blank the separator cell
@@ -355,10 +369,13 @@ function composeFrame(f, scroll) {
       for (let x = 0; x < cells.cols; x++) {
         const ov = overrides.get(y * cells.cols + x);
         const o = (y * cells.cols + x) * 3;
+        // Self-contained style per run: leading 0 resets bold/underline from
+        // the previous run, then colour, then this run's attributes.
         const c = ov
-          ? '\x1b[38;2;' + ov[0] + ';' + ov[1] + ';' + ov[2] + 'm'
-          : '\x1b[38;2;' + colors[o] + ';' + colors[o + 1] + ';' + colors[o + 2] + 'm';
-        if (c !== last) { line += c; last = c; } // only emit colour changes
+          ? '\x1b[0;38;2;' + ov.c[0] + ';' + ov.c[1] + ';' + ov.c[2] +
+            (ov.b ? ';1' : '') + (ov.u ? ';4' : '') + 'm'
+          : '\x1b[0;38;2;' + colors[o] + ';' + colors[o + 1] + ';' + colors[o + 2] + 'm';
+        if (c !== last) { line += c; last = c; } // only emit style changes
         line += chars[y][x];
       }
       line += '\x1b[0m';
