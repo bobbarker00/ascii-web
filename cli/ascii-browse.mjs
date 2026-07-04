@@ -10,10 +10,17 @@
 //   - keys are forwarded as scrolling; q quits
 //
 // Usage:
-//   ascii-browse <url> [--cell 8] [--threshold 0.08] [--fps 10] [--mono] [--once]
+//   ascii-browse <url> [--cell 8] [--threshold 0.08] [--fps 10]
+//                      [--mono] [--invert] [--once]
 //
+// --invert flips the fill ramp ("paper mode"): right for mostly-white sites,
+//   where the default bright->dense mapping yields a wall of @.
 // --once renders a single frame to stdout and exits (no alt screen) — handy
-// for piping to a file or smoke-testing without a TTY.
+//   for piping to a file or smoke-testing without a TTY.
+//
+// Interaction: mouse click = click the page (links, buttons, consent
+// dialogs), wheel or arrows/PgUp/PgDn/space = scroll (real wheel events, so
+// modal/container scrolling works too), g/G top/bottom, q quit.
 
 import puppeteer from 'puppeteer-core';
 import { readFileSync } from 'node:fs';
@@ -26,11 +33,12 @@ const PIPELINE_FILES = ['glyph-atlas.js', 'shaders.js', 'ascii-renderer.js'];
 
 // ---- args -------------------------------------------------------------------
 const argv = process.argv.slice(2);
-const opt = { cell: 8, threshold: 0.08, fps: 10, mono: false, once: false };
+const opt = { cell: 8, threshold: 0.08, fps: 10, mono: false, invert: false, once: false };
 let url = null;
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a === '--mono') opt.mono = true;
+  else if (a === '--invert') opt.invert = true;
   else if (a === '--once') opt.once = true;
   else if (a === '--cell') opt.cell = Math.max(2, Math.min(24, +argv[++i] || 8));
   else if (a === '--threshold') opt.threshold = +argv[++i] || 0.08;
@@ -42,7 +50,7 @@ for (let i = 0; i < argv.length; i++) {
   }
 }
 if (!url) {
-  console.error('usage: ascii-browse <url> [--cell 8] [--threshold 0.08] [--fps 10] [--mono] [--once]');
+  console.error('usage: ascii-browse <url> [--cell 8] [--threshold 0.08] [--fps 10] [--mono] [--invert] [--once]');
   process.exit(1);
 }
 if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(url)) url = 'https://' + url;
@@ -94,7 +102,8 @@ async function quit(code) {
   if (quitting) return;
   quitting = true;
   if (!opt.once) {
-    process.stdout.write('\x1b[0m\x1b[?25h\x1b[?1049l'); // colours, cursor, main screen
+    // colours, mouse reporting off, cursor, main screen
+    process.stdout.write('\x1b[0m\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l');
     if (process.stdin.isTTY) process.stdin.setRawMode(false);
     process.stdin.pause();
   }
@@ -122,20 +131,22 @@ await rendererPage.evaluate(() => {
 
 // One frame: screenshot the page tab, convert in the renderer tab.
 async function captureFrame() {
-  const b64 = await page.screenshot({ type: 'jpeg', quality: 70, encoding: 'base64' });
-  return rendererPage.evaluate(async (b64, cell, threshold) => {
+  // Quality matters here: JPEG artifacts read as spurious DoG edges.
+  const b64 = await page.screenshot({ type: 'jpeg', quality: 90, encoding: 'base64' });
+  return rendererPage.evaluate(async (b64, cell, threshold, invert) => {
     const blob = await (await fetch('data:image/jpeg;base64,' + b64)).blob();
     // flipY baked in: WebGL ignores UNPACK_FLIP_Y for ImageBitmap sources.
     const bmp = await createImageBitmap(blob, { imageOrientation: 'flipY' });
     const g = window.__r.readCells(bmp, bmp.width, bmp.height, {
       cellSize: cell,
       cellAspect: 2,
-      edgeThreshold: threshold
+      edgeThreshold: threshold,
+      invert: invert
     });
     bmp.close();
     if (!g) return null;
     return { cols: g.cols, rows: g.rows, text: g.text, colors: Array.from(g.colors) };
-  }, b64, CW, opt.threshold);
+  }, b64, CW, opt.threshold, opt.invert);
 }
 
 // ---- drawing ----------------------------------------------------------------
@@ -162,8 +173,8 @@ function frameToAnsi(f) {
 
 function draw(f) {
   const rowsOut = frameToAnsi(f);
-  const status = '\x1b[7m ' + url.slice(0, grid.cols - 40) +
-    '  |  q quit   ↑/↓ PgUp/PgDn space scroll \x1b[0m';
+  const status = '\x1b[7m ' + url.slice(0, grid.cols - 48) +
+    '  |  q quit   click = click   wheel/↑↓/PgUpDn scroll \x1b[0m';
   process.stdout.write('\x1b[H' + rowsOut.map((l) => l + '\x1b[K\n').join('') + status + '\x1b[K');
 }
 
@@ -176,21 +187,49 @@ if (opt.once) {
 }
 
 // ---- input ------------------------------------------------------------------
+// Scrolling dispatches real wheel events (not window.scrollBy) so it works on
+// pages that scroll a container or lock body scroll (consent modals etc.).
+// Terminal mouse reporting (SGR) makes cells clickable: cell -> page pixels.
+let mouseX = 0; // last known page-pixel position; wheel lands here
+let mouseY = 0;
+
+function wheel(dy) {
+  const x = mouseX || (grid.cols * CW) / 2;
+  const y = mouseY || (grid.rows * CH) / 2;
+  page.mouse.move(x, y)
+    .then(() => page.mouse.wheel({ deltaY: dy }))
+    .catch(() => {});
+}
+
+const SGR_MOUSE = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/g;
+
 if (process.stdin.isTTY) {
   process.stdin.setRawMode(true);
   process.stdin.resume();
   process.stdin.on('data', (buf) => {
-    const s = buf.toString('latin1');
+    let s = buf.toString('latin1');
     const pageH = grid.rows * CH;
-    if (s === 'q' || s === '\x03') return quit(0);
-    let dy = 0;
-    if (s === '\x1b[A') dy = -CH * 3;          // up
-    else if (s === '\x1b[B') dy = CH * 3;      // down
-    else if (s === '\x1b[5~') dy = -pageH;     // PgUp
-    else if (s === '\x1b[6~' || s === ' ') dy = pageH; // PgDn / space
-    else if (s === 'g') dy = -1e9;             // top
-    else if (s === 'G') dy = 1e9;              // bottom
-    if (dy) page.evaluate((d) => window.scrollBy(0, d), dy).catch(() => {});
+
+    // Mouse events (may be several per chunk).
+    let m;
+    while ((m = SGR_MOUSE.exec(s))) {
+      const btn = +m[1];
+      mouseX = (+m[2] - 0.5) * CW; // 1-based cell -> page pixel at cell centre
+      mouseY = (+m[3] - 0.5) * CH;
+      if (btn === 0 && m[4] === 'm') {
+        page.mouse.click(mouseX, mouseY).catch(() => {}); // click on release
+      } else if (btn === 64) wheel(-CH * 3); // wheel up
+      else if (btn === 65) wheel(CH * 3);    // wheel down
+    }
+    s = s.replace(/\x1b\[<\d+;\d+;\d+[Mm]/g, '');
+
+    if (s.includes('q') || s.includes('\x03')) return quit(0);
+    if (s.includes('\x1b[A')) wheel(-CH * 3);            // up
+    else if (s.includes('\x1b[B')) wheel(CH * 3);        // down
+    else if (s.includes('\x1b[5~')) wheel(-pageH);       // PgUp
+    else if (s.includes('\x1b[6~') || s === ' ') wheel(pageH); // PgDn / space
+    else if (s === 'g') page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+    else if (s === 'G') page.evaluate(() => window.scrollTo(0, 1e9)).catch(() => {});
   });
 }
 
@@ -202,7 +241,8 @@ process.stdout.on('resize', () => {
 
 // ---- frame loop ---------------------------------------------------------------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-process.stdout.write('\x1b[?1049h\x1b[?25l\x1b[2J'); // alt screen, hide cursor
+// Alt screen, hide cursor, clear, enable SGR mouse reporting.
+process.stdout.write('\x1b[?1049h\x1b[?25l\x1b[2J\x1b[?1000h\x1b[?1006h');
 while (!quitting) {
   const t0 = Date.now();
   try {

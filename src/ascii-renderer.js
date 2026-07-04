@@ -299,7 +299,11 @@
         if (cellBuf[i + 1] / 255 > threshold) {
           idx = edgeBase + Math.round((cellBuf[i + 2] / 255) * 3);
         } else {
-          idx = Math.min(fillCount - 1, Math.floor((cellBuf[i] / 255) * fillCount));
+          // opts.invert flips the ramp ("paper mode"): dark ink on a bright
+          // page becomes the dense glyphs. Right for mostly-white sources.
+          let l = cellBuf[i] / 255;
+          if (opts.invert) l = 1 - l;
+          idx = Math.min(fillCount - 1, Math.floor(l * fillCount));
         }
         const o = y * cols + x;
         glyphs[o] = idx;
