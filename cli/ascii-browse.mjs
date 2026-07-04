@@ -70,8 +70,15 @@ function chromePath() {
 async function launch() {
   const common = {
     headless: true,
-    // Software WebGL2: newer Chrome needs the flag to allow SwiftShader.
-    args: ['--enable-unsafe-swiftshader', '--hide-scrollbars', '--mute-audio']
+    args: [
+      // Software WebGL2: newer Chrome needs the flag to allow SwiftShader.
+      '--enable-unsafe-swiftshader',
+      '--hide-scrollbars',
+      '--mute-audio',
+      // Headless counts no input as "no user gesture": videos never start
+      // without this.
+      '--autoplay-policy=no-user-gesture-required'
+    ]
   };
   try {
     return await puppeteer.launch(Object.assign({ channel: 'chrome' }, common));
@@ -114,6 +121,9 @@ process.on('SIGINT', () => quit(130));
 process.on('SIGTERM', () => quit(143));
 
 const page = await browser.newPage();
+// Sites sniff "HeadlessChrome" in the UA and serve degraded players.
+const ua = await browser.userAgent();
+await page.setUserAgent(ua.replace(/HeadlessChrome/gi, 'Chrome'));
 let grid = termGrid();
 await page.setViewport({ width: grid.cols * CW, height: grid.rows * CH, deviceScaleFactor: 1 });
 await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e) => {
