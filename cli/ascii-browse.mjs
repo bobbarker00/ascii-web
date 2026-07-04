@@ -55,12 +55,17 @@
 // colour/grayscale/mono. Mouse click/wheel work in every mode.
 
 import puppeteer from 'puppeteer-core';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { execSync, spawn } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const SRC_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'src');
+// In the repo, the pipeline lives in ../src (shared with the extension); an
+// installed npm package carries a bundled copy in ./shared (see prepack).
+const HERE = dirname(fileURLToPath(import.meta.url));
+const SRC_DIR = existsSync(join(HERE, '..', 'src', 'shaders.js'))
+  ? join(HERE, '..', 'src')
+  : join(HERE, 'shared');
 const PIPELINE_FILES = ['glyph-atlas.js', 'shaders.js', 'ascii-renderer.js'];
 
 // ---- args -------------------------------------------------------------------

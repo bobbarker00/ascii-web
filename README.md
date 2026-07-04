@@ -58,9 +58,28 @@ contexts at ~16, and a page can have more images than that).
 3. Click **Load unpacked** and select this `ascii-web` folder.
 4. Open any page with images or a video, click the toolbar icon, tick **Enabled**.
 
-For **Firefox**: change `manifest.json`'s `action` key to `browser_action` (or
-use a Firefox-specific manifest), then load via `about:debugging` → This Firefox →
-Load Temporary Add-on → pick `manifest.json`.
+For **Firefox** (109+, MV3): use the Firefox build — `manifest.firefox.json`
+swaps the background service worker for an event page (`background.scripts`,
+the one MV3 difference that matters) and adds the required `gecko.id`. Build
+`dist/ascii-web-firefox-<v>.zip` with `scripts/package.sh`, then load via
+`about:debugging` → This Firefox → Load Temporary Add-on (or sign it on AMO
+for a permanent install — change the `gecko.id` to your own first). Two
+Firefox notes: grant "Access your data for all websites" in about:addons for
+the cross-origin image fallback to work, and animated GIFs stay static
+(Firefox has no WebCodecs `ImageDecoder`; the code falls back gracefully).
+
+## Packaging
+
+`scripts/package.sh` builds everything into `dist/`:
+
+| Artifact | Install |
+| --- | --- |
+| `ascii-web-chrome-<v>.zip` | Drag into `chrome://extensions` (dev mode), or upload to the Chrome Web Store. |
+| `ascii-web-firefox-<v>.zip` | `about:debugging` → Load Temporary Add-on, or sign on AMO. |
+| `ascii-browse-<v>.tgz` | `npm install -g ./dist/ascii-browse-<v>.tgz` → `ascii-browse <url>` anywhere. The tarball bundles the shared pipeline files, so it works standalone (note the `./` — npm misreads a bare `dist/...` path as a GitHub repo). |
+
+`scripts/make-icons.mjs` regenerates the extension icons (uses headless
+Chrome, no image tooling needed).
 
 ## Install (terminal browser)
 

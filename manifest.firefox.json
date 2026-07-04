@@ -12,7 +12,13 @@
   "permissions": ["storage", "activeTab"],
   "host_permissions": ["<all_urls>"],
   "background": {
-    "service_worker": "src/background.js"
+    "scripts": ["src/background.js"]
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "ascii-web@wdavis.local",
+      "strict_min_version": "115.0"
+    }
   },
   "action": {
     "default_popup": "popup.html",

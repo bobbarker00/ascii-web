@@ -1,11 +1,18 @@
 {
   "name": "ascii-browse",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Terminal frontend for the ASCII Web shader pipeline: browse the web as ASCII art.",
   "bin": {
     "ascii-browse": "./ascii-browse.mjs"
+  },
+  "files": [
+    "ascii-browse.mjs",
+    "shared/"
+  ],
+  "scripts": {
+    "prepack": "node copy-shared.mjs"
   },
   "dependencies": {
     "puppeteer-core": "^23.0.0"
