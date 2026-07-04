@@ -3,12 +3,16 @@
 //
 // Architecture (the same pipeline as the extension, different display):
 //   - headless Chrome renders the real page in one tab
-//   - CDP screencast pushes compositor frames (idle page = no work)
+//   - page.screenshot() polling captures frames; identical captures are
+//     skipped, so an idle page costs one JPEG encode and no conversion.
+//     (CDP screencast looked cleaner but delivers no frames for a
+//     backgrounded tab, and our renderer tab backgrounds the page tab.)
 //   - a second blank tab runs the extension's own shader files
 //     (glyph-atlas.js, shaders.js, ascii-renderer.js) on those frames;
 //     readCells() hands back the cell grid
 //   - a DOM text layer stamps the page's real text over the art as readable
-//     characters at their true positions (ASCII-art'd text is gibberish)
+//     characters at their true positions (ASCII-art'd text is gibberish);
+//     dark CSS colours are lifted so they stay visible on a dark terminal
 //   - the merged grid is written as ANSI truecolor frames
 //
 // Usage:
@@ -156,6 +160,10 @@ for (const f of PIPELINE_FILES) {
 await rendererPage.evaluate(() => {
   window.__r = new window.__AsciiWeb.AsciiRenderer(); // throws if WebGL2 missing
 });
+// Keep the page tab frontmost: background tabs get rAF throttled to ~1fps,
+// which crawls every animation on the page. The renderer tab doesn't care —
+// its WebGL work is driven synchronously by our evaluate() calls.
+await page.bringToFront();
 
 // ---- frame conversion (runs in the renderer tab) ------------------------------
 async function convert(b64) {
@@ -187,7 +195,7 @@ let words = [];
 let lastExtract = 0;
 
 async function extractText() {
-  words = await page.evaluate(() => {
+  const raw = await page.evaluate(() => {
     const out = [];
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
     const range = document.createRange();
@@ -213,7 +221,18 @@ async function extractText() {
       }
     }
     return out;
-  }).catch(() => words);
+  }).catch(() => null);
+  if (!raw) return; // mid-navigation; keep the old words until the next pass
+
+  // Dark CSS text (e.g. Wikipedia body copy) is invisible on a dark terminal:
+  // lift low-luminance colours most of the way to white, keeping some hue.
+  for (const w of raw) {
+    const luma = 0.299 * w.c[0] + 0.587 * w.c[1] + 0.114 * w.c[2];
+    if (luma < 120) {
+      w.c = w.c.map((v) => Math.round(v + (255 - v) * 0.75));
+    }
+  }
+  words = raw;
 }
 
 // ---- drawing ------------------------------------------------------------------
@@ -335,58 +354,38 @@ if (process.stdin.isTTY) {
   });
 }
 
-// ---- screencast ---------------------------------------------------------------
-// The compositor pushes frames only when something changed: an idle page costs
-// nothing, an animated one streams. We convert/draw the newest frame at our
-// own pace and drop the rest.
-const cdp = await page.createCDPSession();
-let latestFrame = null;
-let frameDirty = false;
-redraw = () => { frameDirty = true; };
-
-cdp.on('Page.screencastFrame', (ev) => {
-  latestFrame = ev.data;
-  frameDirty = true;
-  cdp.send('Page.screencastFrameAck', { sessionId: ev.sessionId }).catch(() => {});
-});
-
-async function startScreencast() {
-  await cdp.send('Page.startScreencast', {
-    format: 'jpeg',
-    quality: 90,
-    maxWidth: grid.cols * CW * DSF,
-    maxHeight: grid.rows * CH * DSF,
-    everyNthFrame: 1
-  }).catch(() => {});
-}
-await startScreencast();
+// ---- frame loop -----------------------------------------------------------------
+// page.screenshot() forces a capture even for a backgrounded tab (which the
+// page tab is — the renderer tab was opened after it). Identical captures are
+// skipped so idle pages don't burn conversion work; toggles force a redraw.
+let lastShot = '';
+let force = true;
+redraw = () => { force = true; };
 
 process.stdout.on('resize', () => {
   grid = termGrid();
-  applyViewport()
-    .then(() => cdp.send('Page.stopScreencast').catch(() => {}))
-    .then(startScreencast)
-    .catch(() => {});
+  applyViewport().then(() => { force = true; }).catch(() => {});
 });
 
-// ---- frame loop -----------------------------------------------------------------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Alt screen, hide cursor, clear, enable SGR mouse reporting.
 process.stdout.write('\x1b[?1049h\x1b[?25l\x1b[2J\x1b[?1000h\x1b[?1006h');
 
 while (!quitting) {
   const t0 = Date.now();
-  if (frameDirty && latestFrame) {
-    frameDirty = false;
-    try {
+  try {
+    const b64 = await page.screenshot({ type: 'jpeg', quality: 90, encoding: 'base64' });
+    if (b64 !== lastShot || force) {
+      lastShot = b64;
+      force = false;
       const [f, scroll] = await Promise.all([
-        convert(latestFrame),
+        convert(b64),
         page.evaluate(() => ({ sx: scrollX, sy: scrollY }))
       ]);
       if (f && !quitting) draw(f, scroll);
-    } catch (e) {
-      if (!quitting) process.stdout.write('\x1b[H\x1b[0mframe error: ' + e.message + '\x1b[K');
     }
+  } catch (e) {
+    // Mid-navigation capture race; keep the last frame and try again.
   }
   if (!opt.noText && Date.now() - lastExtract > 1000) {
     lastExtract = Date.now();
