@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "ASCII Web",
+  "version": "0.1.0",
+  "description": "Renders images and videos on any page as live ASCII art using a WebGL2 shader pipeline.",
+  "permissions": ["storage", "activeTab"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "ASCII Web"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "run_at": "document_idle",
+      "all_frames": false,
+      "js": [
+        "src/glyph-atlas.js",
+        "src/shaders.js",
+        "src/ascii-renderer.js",
+        "src/content.js"
+      ]
+    }
+  ]
+}

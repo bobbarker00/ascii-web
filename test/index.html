@@ -1,0 +1,153 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>ASCII Web — orientation & CORS test page</title>
+  <style>
+    body { font: 14px system-ui, sans-serif; background: #222; color: #ddd; margin: 24px; }
+    h1 { font-size: 18px; }
+    .grid { display: flex; flex-wrap: wrap; gap: 24px; }
+    figure { margin: 0; }
+    figcaption { margin-top: 6px; font-size: 12px; color: #aaa; max-width: 256px; }
+    img, video { display: block; background: #000; }
+  </style>
+</head>
+<body>
+  <h1>ASCII Web test page</h1>
+  <p>Enable the extension via the toolbar popup, then compare each ASCII overlay
+     against its caption. Open DevTools to see the cross-origin skip logs.</p>
+
+  <div class="grid">
+    <figure>
+      <img id="orient" width="256" height="256" alt="orientation" />
+      <figcaption><b>Orientation:</b> the word TOP and the arrowhead must be at
+        the top, and the fill ramp should get denser toward the bright top.
+        Upside-down &rarr; flip bug.</figcaption>
+    </figure>
+
+    <figure>
+      <img id="diagFwd" width="256" height="256" alt="forward diagonal" />
+      <figcaption><b>Forward diagonal:</b> a stripe from bottom-left to
+        top-right. Its outline should be drawn with <code>/</code> glyphs.
+        <code>\</code> instead &rarr; diagonals swapped.</figcaption>
+    </figure>
+
+    <figure>
+      <img id="diagBack" width="256" height="256" alt="back diagonal" />
+      <figcaption><b>Back diagonal:</b> top-left to bottom-right, should be
+        <code>\</code> glyphs.</figcaption>
+    </figure>
+
+    <figure>
+      <img id="box" width="256" height="256" alt="box" />
+      <figcaption><b>Box:</b> vertical sides &rarr; <code>|</code>, horizontal
+        sides &rarr; <code>-</code>. Wrong way round &rarr; gx/gy or angle-bucket
+        bug (not just a diagonal swap).</figcaption>
+    </figure>
+
+    <figure>
+      <video id="clock" width="256" height="256" autoplay muted playsinline></video>
+      <figcaption><b>Video:</b> a rotating clock hand (via captureStream). Should
+        convert live and sweep clockwise from 12 o'clock. Counter-clockwise or
+        starting at 6 &rarr; video-upload flip differs from images.</figcaption>
+    </figure>
+
+    <figure>
+      <img id="corsNo" width="256" height="256" alt="cross-origin, no CORS"
+           src="https://picsum.photos/id/237/256/256" />
+      <figcaption><b>Cross-origin, no CORS:</b> should stay a normal photo
+        (silently skipped) and log <code>[ASCII Web] skipped, upload threw
+        SecurityError</code> once in the console.</figcaption>
+    </figure>
+
+    <figure>
+      <img id="corsYes" width="256" height="256" alt="cross-origin with CORS"
+           crossorigin="anonymous" src="https://picsum.photos/id/237/256/256" />
+      <figcaption><b>Cross-origin with <code>crossorigin="anonymous"</code>:</b>
+        same photo, but this one <em>should</em> convert (picsum serves CORS
+        headers).</figcaption>
+    </figure>
+  </div>
+
+  <script>
+    // Draw each test pattern into a canvas and hand it to the <img> as a data
+    // URI — data: sources are same-origin, so they exercise the happy path.
+    function pattern(id, draw) {
+      const c = document.createElement('canvas');
+      c.width = c.height = 256;
+      const ctx = c.getContext('2d');
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, 256, 256);
+      draw(ctx);
+      document.getElementById(id).src = c.toDataURL();
+    }
+
+    pattern('orient', (ctx) => {
+      // Luminance ramp: dark at the bottom, bright at the top.
+      const g = ctx.createLinearGradient(0, 256, 0, 0);
+      g.addColorStop(0, '#111');
+      g.addColorStop(1, '#eee');
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, 256, 256);
+      // Up arrow + label, in black so they read against the bright top.
+      ctx.fillStyle = '#000';
+      ctx.beginPath();
+      ctx.moveTo(128, 40); ctx.lineTo(88, 110); ctx.lineTo(168, 110);
+      ctx.closePath(); ctx.fill();
+      ctx.fillRect(116, 110, 24, 100);
+      ctx.font = 'bold 36px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('TOP', 128, 36);
+    });
+
+    pattern('diagFwd', (ctx) => {
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 28;
+      ctx.beginPath();
+      ctx.moveTo(24, 232); ctx.lineTo(232, 24); // bottom-left -> top-right: '/'
+      ctx.stroke();
+    });
+
+    pattern('diagBack', (ctx) => {
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 28;
+      ctx.beginPath();
+      ctx.moveTo(24, 24); ctx.lineTo(232, 232); // top-left -> bottom-right: '\'
+      ctx.stroke();
+    });
+
+    pattern('box', (ctx) => {
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 20;
+      ctx.strokeRect(48, 48, 160, 160);
+    });
+
+    // Live video source: a canvas clock hand piped through captureStream.
+    (function () {
+      const c = document.createElement('canvas');
+      c.width = c.height = 256;
+      const ctx = c.getContext('2d');
+      let t = 0;
+      (function tick() {
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, 256, 256);
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 14;
+        // Sweeps clockwise, starting at 12 o'clock.
+        const a = t - Math.PI / 2;
+        ctx.beginPath();
+        ctx.moveTo(128, 128);
+        ctx.lineTo(128 + 100 * Math.cos(a), 128 + 100 * Math.sin(a));
+        ctx.stroke();
+        ctx.font = 'bold 28px sans-serif';
+        ctx.fillStyle = '#fff';
+        ctx.textAlign = 'center';
+        ctx.fillText('12', 128, 30);
+        t += 0.02;
+        requestAnimationFrame(tick);
+      })();
+      document.getElementById('clock').srcObject = c.captureStream(30);
+    })();
+  </script>
+</body>
+</html>
