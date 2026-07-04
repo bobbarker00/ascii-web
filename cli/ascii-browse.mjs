@@ -46,12 +46,13 @@
 //           visible window you can minimize.
 // --once    renders a single frame to stdout and exits (no TTY needed).
 //
-// Keys (normal mode): q quit · o open URL · f link hints (type the label to
-// click; works on links/buttons/inputs — selecting an input enters insert
-// mode) · e insert mode (keys forward to the page; Esc exits) · H/L history
-// back/forward · wheel/↑↓/PgUp/PgDn/space scroll · g/G top/bottom · t text
-// overlay · i invert · b braille · c cycle colour/grayscale/mono. Mouse
-// click/wheel work in every mode.
+// Keys (normal mode): q quit · o open URL · / find in page (type to search,
+// Tab/Shift-Tab cycle matches, Enter clicks the current match, Esc done) ·
+// f link hints (type the label to click; works on links/buttons/inputs —
+// selecting an input enters insert mode) · e insert mode (keys forward to
+// the page; Esc exits) · H/L history back/forward · wheel/↑↓/PgUp/PgDn/space
+// scroll · g/G top/bottom · t text overlay · i invert · b braille · c cycle
+// colour/grayscale/mono. Mouse click/wheel work in every mode.
 
 import puppeteer from 'puppeteer-core';
 import { readFileSync } from 'node:fs';
@@ -516,6 +517,14 @@ async function extractText() {
   }
   for (const ln of lines) ln.words.sort((a, b) => a.x - b.x);
   textLines = lines;
+
+  // Re-run any active search against the fresh word objects (highlight sets
+  // hold references, which extraction just replaced).
+  if (mode === 'find' && findQuery) {
+    computeFindMatches();
+    if (findCurrent >= findMatches.length) findCurrent = 0;
+    redraw();
+  }
 }
 
 // ---- modes ----------------------------------------------------------------------
@@ -526,6 +535,50 @@ let mode = 'normal';
 let hints = [];     // [{ label, x, y }] in document CSS pixels
 let hintPrefix = '';
 let urlInput = '';
+let findQuery = '';
+let findMatches = []; // [{ x, y, words: [word refs] }] in document CSS pixels
+let findCurrent = 0;
+
+// Search the extracted text lines (i.e. exactly what's stampable on screen)
+// for the query, case-insensitive, spanning word boundaries within a line.
+function computeFindMatches() {
+  findMatches = [];
+  const q = findQuery.toLowerCase();
+  if (!q) return;
+  for (const ln of textLines) {
+    let txt = '';
+    const map = []; // char index in txt -> word index (-1 = separator)
+    ln.words.forEach((w, wi) => {
+      if (txt) { txt += ' '; map.push(-1); }
+      for (let k = 0; k < w.t.length; k++) map.push(wi);
+      txt += w.t;
+    });
+    const lower = txt.toLowerCase();
+    let idx = 0;
+    while ((idx = lower.indexOf(q, idx)) !== -1) {
+      const wset = new Set();
+      for (let k = idx; k < idx + q.length; k++) {
+        if (map[k] >= 0) wset.add(ln.words[map[k]]);
+      }
+      if (wset.size) {
+        const words = [...wset];
+        findMatches.push({ x: words[0].x, y: words[0].y, words });
+      }
+      idx += q.length;
+      if (findMatches.length >= 200) return;
+    }
+  }
+}
+
+function scrollToFindMatch() {
+  const m = findMatches[findCurrent];
+  if (!m) return;
+  page.evaluate((y, vh) => {
+    if (y < scrollY + vh * 0.15 || y > scrollY + vh * 0.85) {
+      window.scrollTo(0, Math.max(0, y - vh / 2));
+    }
+  }, m.y, grid.rows * CH).catch(() => {});
+}
 
 const HINT_ALPHABET = 'asdfghjklqwertyuiopzxcvbnm';
 
@@ -663,7 +716,16 @@ function composeFrame(f, scroll) {
   const cells = f.braille ? cellsFromBraille(f) : cellsFromAscii(f);
   const chars = cells.chars;
   const colors = cells.colors;
-  const overrides = new Map(); // cellIndex -> [r,g,b] from CSS text colour
+  const overrides = new Map(); // cellIndex -> word/hint object
+
+  // Find-mode highlight sets, checked by identity in the emitter.
+  let findAll = null;
+  let findCur = null;
+  if (mode === 'find' && findMatches.length) {
+    findAll = new Set();
+    for (const m of findMatches) for (const w of m.words) findAll.add(w);
+    findCur = new Set(findMatches[Math.min(findCurrent, findMatches.length - 1)].words);
+  }
 
   // Cells under a true-pixel image go blank: kitty draws at z=-1 beneath the
   // text layer (spaces reveal it, words/hints still stamp on top), and sixel
@@ -756,11 +818,15 @@ function composeFrame(f, scroll) {
   for (let y = 0; y < height; y++) {
     let line = '';
     if (opt.colorMode === 'mono') {
-      // Unstyled page content — but hint labels are UI, not content, so
-      // they keep a highlight (reverse video needs no colour support).
+      // Unstyled page content — but hint labels and find highlights are UI,
+      // not content, so they keep a highlight (reverse video needs no
+      // colour support; the current find match adds bold).
       for (let x = 0; x < cells.cols; x++) {
         const ov = overrides.get(y * cells.cols + x);
-        line += ov && ov.hint ? '\x1b[7m' + chars[y][x] + '\x1b[0m' : chars[y][x];
+        if (ov && ov.hint) line += '\x1b[7m' + chars[y][x] + '\x1b[0m';
+        else if (ov && findCur && findCur.has(ov)) line += '\x1b[7;1m' + chars[y][x] + '\x1b[0m';
+        else if (ov && findAll && findAll.has(ov)) line += '\x1b[7m' + chars[y][x] + '\x1b[0m';
+        else line += chars[y][x];
       }
     } else {
       const gray = opt.colorMode === 'gray';
@@ -777,6 +843,10 @@ function composeFrame(f, scroll) {
         let c;
         if (ov && ov.hint) {
           c = '\x1b[0;30;103m'; // hint label: black on bright yellow
+        } else if (ov && findCur && findCur.has(ov)) {
+          c = '\x1b[0;30;106m'; // current find match: black on bright cyan
+        } else if (ov && findAll && findAll.has(ov)) {
+          c = '\x1b[0;30;46m';  // other find matches: black on cyan
         } else {
           let fg = ov ? ov.c : [colors[o], colors[o + 1], colors[o + 2]];
           let bg = (ov && ov.bg) || null;
@@ -809,13 +879,19 @@ function draw(f, scroll) {
   let status;
   if (mode === 'url') {
     status = '\x1b[7m Open: ' + urlInput + '▏ — Enter go · Esc cancel \x1b[0m';
+  } else if (mode === 'find') {
+    const count = findMatches.length
+      ? (Math.min(findCurrent, findMatches.length - 1) + 1) + '/' + findMatches.length
+      : (findQuery ? 'no matches' : '');
+    status = '\x1b[7m Find: ' + findQuery + '▏ ' + count +
+      ' — Tab/⇧Tab cycle · Enter click · Esc done \x1b[0m';
   } else {
     let help;
     if (mode === 'insert') help = ' -- INSERT -- keys go to the page · Esc back ';
     else if (mode === 'hint') help = ' -- LINKS ' + hintPrefix + ' -- type a label · Esc cancel ';
     else {
       const flag = (k, on) => k + (on ? '✓' : '·');
-      help = ' | q quit · o url · f links · e type · H/L hist · ' +
+      help = ' | q quit · o url · / find · f links · e type · H/L hist · ' +
         flag('t', !opt.noText) + ' ' + flag('i', opt.invert) + ' ' + flag('b', opt.braille) +
         (pixelMode ? ' ' + flag('p', pixelsOn) : '') + ' c:' + opt.colorMode + ' ';
     }
@@ -996,6 +1072,37 @@ if (process.stdin.isTTY) {
       return;
     }
 
+    if (mode === 'find') {
+      if (s === '\x1b') {
+        mode = 'normal'; findQuery = ''; findMatches = []; redraw(); return;
+      }
+      if (s === '\t' || s === '\x1b[Z') { // Tab / Shift-Tab: cycle matches
+        if (findMatches.length) {
+          const step = s === '\t' ? 1 : -1;
+          findCurrent = (findCurrent + step + findMatches.length) % findMatches.length;
+          scrollToFindMatch();
+        }
+        redraw();
+        return;
+      }
+      for (const ch of s) {
+        if (ch === '\r') { // click the current match
+          const m = findMatches[findCurrent];
+          mode = 'normal'; findQuery = ''; findMatches = [];
+          if (m) clickHint({ x: m.x + 2, y: m.y });
+          redraw();
+          return;
+        }
+        if (ch === '\x7f' || ch === '\b') findQuery = findQuery.slice(0, -1);
+        else if (ch >= ' ') findQuery += ch;
+      }
+      computeFindMatches();
+      findCurrent = 0;
+      if (findMatches.length) scrollToFindMatch();
+      redraw();
+      return;
+    }
+
     if (mode === 'url') {
       if (s === '\x1b') { mode = 'normal'; redraw(); return; }
       for (const ch of s) {
@@ -1047,6 +1154,7 @@ if (process.stdin.isTTY) {
     else if (s === 'f') startHints();
     else if (s === 'e') { mode = 'insert'; redraw(); }
     else if (s === 'o') { mode = 'url'; urlInput = ''; redraw(); }
+    else if (s === '/') { mode = 'find'; findQuery = ''; findMatches = []; findCurrent = 0; redraw(); }
     else if (s === 'c') {
       const order = ['color', 'gray', 'mono'];
       opt.colorMode = order[(order.indexOf(opt.colorMode) + 1) % order.length];
