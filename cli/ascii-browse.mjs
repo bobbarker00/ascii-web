@@ -187,6 +187,29 @@ const atlasInfo = await rendererPage.evaluate(() => {
   return { fillCount: a.fillCount, edgeBase: a.edgeBase };
 });
 
+// When the DOM text layer is on, hide the page's own text in the capture:
+// the edge detector otherwise fires on rendered glyphs, leaving "static"
+// around every line of text. Layout and media are unaffected — words come
+// exclusively from the DOM layer.
+async function setTextHidden(hidden) {
+  await page.evaluate((on) => {
+    let el = document.getElementById('__ascii_hide_text');
+    if (on && !el) {
+      el = document.createElement('style');
+      el.id = '__ascii_hide_text';
+      el.textContent = 'body * { color: transparent !important; text-shadow: none !important; }';
+      document.documentElement.appendChild(el);
+    } else if (!on && el) {
+      el.remove();
+    }
+  }, hidden).catch(() => {});
+}
+await setTextHidden(!opt.noText);
+// Navigations wipe injected styles; re-apply.
+page.on('framenavigated', (fr) => {
+  if (!fr.parentFrame()) setTextHidden(!opt.noText);
+});
+
 // ---- frame conversion (runs in the renderer tab) ------------------------------
 // ASCII mode: one shader cell per terminal cell (aspect 2).
 // Braille mode: square subcells at half the cell width — a terminal cell
@@ -385,11 +408,31 @@ function composeFrame(f, scroll) {
   return out;
 }
 
+// Frame diffing: only rows whose styled content changed get rewritten. This
+// is the flicker fix — an unchanged row is never touched, and during video
+// only the media rows update.
+let prevRows = [];
+let prevStatus = '';
+
 function draw(f, scroll) {
   const rowsOut = composeFrame(f, scroll);
   const status = '\x1b[7m ' + url.slice(0, Math.max(10, grid.cols - 56)) +
     ' | q quit · click · scroll · t text · i invert · b braille \x1b[0m';
-  process.stdout.write('\x1b[H' + rowsOut.map((l) => l + '\x1b[K\n').join('') + status + '\x1b[K');
+  let out = '';
+  for (let y = 0; y < rowsOut.length; y++) {
+    if (rowsOut[y] !== prevRows[y]) {
+      out += '\x1b[' + (y + 1) + ';1H' + rowsOut[y] + '\x1b[K';
+    }
+  }
+  for (let y = rowsOut.length; y < prevRows.length; y++) {
+    out += '\x1b[' + (y + 1) + ';1H\x1b[K'; // clear rows the new frame doesn't cover
+  }
+  if (status !== prevStatus) {
+    out += '\x1b[' + (grid.rows + 1) + ';1H' + status + '\x1b[K';
+  }
+  prevRows = rowsOut;
+  prevStatus = status;
+  if (out) process.stdout.write(out);
 }
 
 // ---- --once: single frame to stdout, no TTY needed ----------------------------
@@ -448,7 +491,7 @@ if (process.stdin.isTTY) {
     else if (s.includes('\x1b[6~') || s === ' ') wheel(pageH); // PgDn / space
     else if (s === 'g') page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
     else if (s === 'G') page.evaluate(() => window.scrollTo(0, 1e9)).catch(() => {});
-    else if (s === 't') { opt.noText = !opt.noText; redraw(); }
+    else if (s === 't') { opt.noText = !opt.noText; setTextHidden(!opt.noText); redraw(); }
     else if (s === 'i') { opt.invert = !opt.invert; redraw(); }
     else if (s === 'b') { opt.braille = !opt.braille; redraw(); }
   });
@@ -464,6 +507,9 @@ redraw = () => { force = true; };
 
 process.stdout.on('resize', () => {
   grid = termGrid();
+  prevRows = []; // stale diff baseline; repaint everything
+  prevStatus = '';
+  process.stdout.write('\x1b[2J');
   applyViewport().then(() => { force = true; }).catch(() => {});
 });
 
