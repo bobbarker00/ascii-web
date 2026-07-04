@@ -33,9 +33,12 @@
 //           8x the spatial detail of one ASCII glyph); the DOM text layer
 //           still stamps normal readable characters on top. Trades the ASCII
 //           aesthetic for detail.
-// --sound   (experimental, parked) launches a real (visible) Chrome window
-//           instead of headless and doesn't mute it — minimize the window
-//           and audio plays normally. (Headless Chrome has no audio path.)
+// --sound   audio while staying in the terminal: Chrome's audio stack is
+//           independent of its display stack, so a headful Chrome pointed at
+//           an invisible Xvfb virtual display plays through PipeWire/Pulse
+//           with no window anywhere. Needs the Xvfb binary (Fedora:
+//           dnf install xorg-x11-server-Xvfb); without it, falls back to a
+//           visible window you can minimize.
 // --once    renders a single frame to stdout and exits (no TTY needed).
 //
 // Keys (normal mode): q quit · o open URL · f link hints (type the label to
@@ -47,7 +50,7 @@
 
 import puppeteer from 'puppeteer-core';
 import { readFileSync } from 'node:fs';
-import { execSync } from 'node:child_process';
+import { execSync, spawn } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -106,6 +109,17 @@ function chromePath() {
   return null;
 }
 
+let xvfbProc = null;
+
+function binPath(name) {
+  try {
+    return execSync('command -v ' + name, { shell: '/bin/bash', stdio: ['ignore', 'pipe', 'ignore'] })
+      .toString().trim() || null;
+  } catch (e) {
+    return null;
+  }
+}
+
 async function launch() {
   const args = [
     // Software WebGL2: newer Chrome needs the flag to allow SwiftShader.
@@ -115,10 +129,26 @@ async function launch() {
     // without this.
     '--autoplay-policy=no-user-gesture-required'
   ];
-  // Headless Chrome has no audio output path; --sound runs a real window
-  // (minimize it) so audio reaches the system mixer.
   if (!opt.sound) args.push('--mute-audio');
-  const common = { headless: !opt.sound, args };
+
+  // --sound needs headful Chrome (headless has no audio output path), but
+  // headful doesn't need a *visible* display: an Xvfb virtual display keeps
+  // everything in the terminal while audio flows to the system mixer.
+  let env;
+  if (opt.sound) {
+    const xvfb = binPath('Xvfb');
+    if (xvfb) {
+      const display = ':' + (90 + (process.pid % 40)); // dodge collisions
+      xvfbProc = spawn(xvfb, [display, '-screen', '0', '1600x1000x24', '-nolisten', 'tcp'], { stdio: 'ignore' });
+      xvfbProc.unref();
+      await new Promise((r) => setTimeout(r, 400)); // let the server come up
+      env = Object.assign({}, process.env, { DISPLAY: display });
+    } else {
+      process.stderr.write('--sound: Xvfb not found (dnf install xorg-x11-server-Xvfb); using a visible window\n');
+    }
+  }
+
+  const common = { headless: !opt.sound, args, env };
   try {
     return await puppeteer.launch(Object.assign({ channel: 'chrome' }, common));
   } catch (e) {
@@ -159,6 +189,7 @@ async function quit(code) {
     process.stdin.pause();
   }
   await browser.close().catch(() => {});
+  if (xvfbProc) xvfbProc.kill();
   process.exit(code || 0);
 }
 process.on('SIGINT', () => quit(130));
@@ -771,8 +802,12 @@ function draw(f, scroll) {
     let help;
     if (mode === 'insert') help = ' -- INSERT -- keys go to the page · Esc back ';
     else if (mode === 'hint') help = ' -- LINKS ' + hintPrefix + ' -- type a label · Esc cancel ';
-    else help = ' | q quit · o url · f links · e type · H/L hist · c colour · t/i/b' +
-      (pixelMode ? '/p' : '') + ' ';
+    else {
+      const flag = (k, on) => k + (on ? '✓' : '·');
+      help = ' | q quit · o url · f links · e type · H/L hist · ' +
+        flag('t', !opt.noText) + ' ' + flag('i', opt.invert) + ' ' + flag('b', opt.braille) +
+        (pixelMode ? ' ' + flag('p', pixelsOn) : '') + ' c:' + opt.colorMode + ' ';
+    }
     status = '\x1b[7m ' + url.slice(0, Math.max(10, grid.cols - help.length - 2)) +
       help + '\x1b[0m';
   }
