@@ -46,7 +46,7 @@ four edge glyphs. The shader navigates it by index.
 | `src/background.js` | MV3 service worker: fetches cross-origin image bytes on request (extension fetches bypass page CORS via `host_permissions`). |
 | `popup.html` / `popup.js` | Toggle + cell size / edge strength / colour controls. Writes to `chrome.storage.local`; the content script reacts live. |
 | `test/index.html` | Self-contained test page (orientation, diagonals, live video, CORS cases). Serve with `python3 -m http.server 8123 -d test`, don't open via `file://`. |
-| `cli/ascii-browse.mjs` | Terminal frontend: headless Chrome + screenshot polling (unchanged frames skipped), the same three pipeline files convert frames via `readCells()`, page text is stamped back over the art as real readable characters (DOM text layer). Mouse click/wheel forwarded. `npm install` in `cli/` once, then `node cli/ascii-browse.mjs <url>` (`--mono`, `--invert`, `--no-text`, `--hidpi`, `--cell N`, `--fps N`, `--once`). |
+| `cli/ascii-browse.mjs` | Terminal frontend: headless Chrome + screenshot polling (unchanged frames skipped), the same three pipeline files convert frames via `readCells()`, page text is stamped back over the art as real readable characters (DOM text layer). Mouse click/wheel forwarded. `npm install` in `cli/` once, then `node cli/ascii-browse.mjs <url>` (`--mono`, `--invert`, `--no-text`, `--hidpi`, `--braille` for 8x dot-matrix detail, `--sound` for audio via a real Chrome window, `--cell N`, `--fps N`, `--once`). |
 
 One shared renderer feeds many cheap 2D-canvas overlays (browsers cap WebGL
 contexts at ~16, and a page can have more images than that).
@@ -107,6 +107,8 @@ Load Temporary Add-on → pick `manifest.json`.
   toggle — currently `q` always quits, so text boxes are click-only), a URL
   bar / go-back, diff frames so only changed cells are rewritten, font-size
   aware text stamping (headlines currently render at one cell height).
+- True-pixel media: render image/video boxes via the kitty graphics protocol
+  or sixel in supporting terminals, keeping ASCII/braille as the fallback.
 - Colour text mode (per-cell `<span>`s or CSS custom highlights — `readCells()`
   already returns the colours).
 - Replace the per-cell pixel loop in the aggregate pass with mipmap sampling for

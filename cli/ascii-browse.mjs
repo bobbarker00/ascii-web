@@ -17,16 +17,24 @@
 //
 // Usage:
 //   ascii-browse <url> [--cell 8] [--threshold 0.08] [--fps 10]
-//                      [--mono] [--invert] [--no-text] [--hidpi] [--once]
+//                      [--mono] [--invert] [--no-text] [--hidpi]
+//                      [--braille] [--sound] [--once]
 //
 // --invert  flips the fill ramp ("paper mode"): right for mostly-white sites.
 // --no-text disables the DOM text overlay (pure art mode).
 // --hidpi   captures at 2x device pixels: ~4x source detail per cell, slower.
+// --braille renders imagery as braille dot-matrix cells (2x4 dots per cell =
+//           8x the spatial detail of one ASCII glyph); the DOM text layer
+//           still stamps normal readable characters on top. Trades the ASCII
+//           aesthetic for detail.
+// --sound   launches a real (visible) Chrome window instead of headless and
+//           doesn't mute it — minimize the window and audio plays normally.
+//           (Headless Chrome has no audio output path.)
 // --once    renders a single frame to stdout and exits (no TTY needed).
 //
 // Keys: q quit · mouse click = click the page · wheel/↑↓/PgUp/PgDn/space
 // scroll (real wheel events, so container/modal scrolling works) · g/G
-// top/bottom · t toggle text overlay · i toggle invert.
+// top/bottom · t toggle text overlay · i toggle invert · b toggle braille.
 
 import puppeteer from 'puppeteer-core';
 import { readFileSync } from 'node:fs';
@@ -41,7 +49,8 @@ const PIPELINE_FILES = ['glyph-atlas.js', 'shaders.js', 'ascii-renderer.js'];
 const argv = process.argv.slice(2);
 const opt = {
   cell: 8, threshold: 0.08, fps: 10,
-  mono: false, invert: false, noText: false, hidpi: false, once: false
+  mono: false, invert: false, noText: false, hidpi: false,
+  braille: false, sound: false, once: false
 };
 let url = null;
 for (let i = 0; i < argv.length; i++) {
@@ -50,6 +59,8 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--invert') opt.invert = true;
   else if (a === '--no-text') opt.noText = true;
   else if (a === '--hidpi') opt.hidpi = true;
+  else if (a === '--braille') opt.braille = true;
+  else if (a === '--sound') opt.sound = true;
   else if (a === '--once') opt.once = true;
   else if (a === '--cell') opt.cell = Math.max(2, Math.min(12, +argv[++i] || 8));
   else if (a === '--threshold') opt.threshold = +argv[++i] || 0.08;
@@ -65,6 +76,10 @@ if (!url) {
   process.exit(1);
 }
 if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(url)) url = 'https://' + url;
+// Braille packs a 2x4 dot matrix per cell, so a cell must split evenly into
+// half-width subcells at least 2px wide.
+if (opt.cell % 2) opt.cell += 1;
+if (opt.braille && opt.cell < 4) opt.cell = 4;
 
 // ---- find a Chrome ----------------------------------------------------------
 function chromePath() {
@@ -79,18 +94,18 @@ function chromePath() {
 }
 
 async function launch() {
-  const common = {
-    headless: true,
-    args: [
-      // Software WebGL2: newer Chrome needs the flag to allow SwiftShader.
-      '--enable-unsafe-swiftshader',
-      '--hide-scrollbars',
-      '--mute-audio',
-      // Headless counts no input as "no user gesture": videos never start
-      // without this.
-      '--autoplay-policy=no-user-gesture-required'
-    ]
-  };
+  const args = [
+    // Software WebGL2: newer Chrome needs the flag to allow SwiftShader.
+    '--enable-unsafe-swiftshader',
+    '--hide-scrollbars',
+    // Headless counts no input as "no user gesture": videos never start
+    // without this.
+    '--autoplay-policy=no-user-gesture-required'
+  ];
+  // Headless Chrome has no audio output path; --sound runs a real window
+  // (minimize it) so audio reaches the system mixer.
+  if (!opt.sound) args.push('--mute-audio');
+  const common = { headless: !opt.sound, args };
   try {
     return await puppeteer.launch(Object.assign({ channel: 'chrome' }, common));
   } catch (e) {
@@ -165,27 +180,49 @@ await rendererPage.evaluate(() => {
 // its WebGL work is driven synchronously by our evaluate() calls.
 await page.bringToFront();
 
+// Atlas layout constants (fill-ramp size etc.), needed to turn glyph indices
+// back into "ink" for braille dots.
+const atlasInfo = await rendererPage.evaluate(() => {
+  const a = window.__AsciiWeb.createAtlas(16);
+  return { fillCount: a.fillCount, edgeBase: a.edgeBase };
+});
+
 // ---- frame conversion (runs in the renderer tab) ------------------------------
+// ASCII mode: one shader cell per terminal cell (aspect 2).
+// Braille mode: square subcells at half the cell width — a terminal cell
+// covers exactly 2x4 of them, one per braille dot.
 async function convert(b64) {
-  return rendererPage.evaluate(async (b64, cell, threshold, invert) => {
+  const braille = opt.braille;
+  const f = await rendererPage.evaluate(async (b64, cell, threshold, invert, braille) => {
     const blob = await (await fetch('data:image/jpeg;base64,' + b64)).blob();
     // flipY baked in: WebGL ignores UNPACK_FLIP_Y for ImageBitmap sources.
     const bmp = await createImageBitmap(blob, { imageOrientation: 'flipY' });
     const g = window.__r.readCells(bmp, bmp.width, bmp.height, {
-      cellSize: cell,
-      cellAspect: 2,
+      cellSize: braille ? cell / 2 : cell,
+      cellAspect: braille ? 1 : 2,
       edgeThreshold: threshold,
       invert: invert
     });
     bmp.close();
     if (!g) return null;
-    // Colours as base64 — far cheaper to serialize than a JSON number array.
-    let bin = '';
-    for (let i = 0; i < g.colors.length; i += 8192) {
-      bin += String.fromCharCode.apply(null, g.colors.subarray(i, i + 8192));
-    }
-    return { cols: g.cols, rows: g.rows, text: g.text, colors: btoa(bin) };
-  }, b64, CW * DSF, opt.threshold, opt.invert);
+    // Binary payloads as base64 — far cheaper to serialize than JSON arrays.
+    const b64ify = (arr) => {
+      let bin = '';
+      for (let i = 0; i < arr.length; i += 8192) {
+        bin += String.fromCharCode.apply(null, arr.subarray(i, i + 8192));
+      }
+      return btoa(bin);
+    };
+    return {
+      cols: g.cols,
+      rows: g.rows,
+      text: g.text,
+      colors: b64ify(g.colors),
+      glyphs: braille ? b64ify(g.glyphs) : null
+    };
+  }, b64, CW * DSF, opt.threshold, opt.invert, braille);
+  if (f) f.braille = braille; // pin the mode used, in case 'b' toggles mid-frame
+  return f;
 }
 
 // ---- DOM text layer -----------------------------------------------------------
@@ -236,33 +273,78 @@ async function extractText() {
 }
 
 // ---- drawing ------------------------------------------------------------------
+// Both modes reduce to the same terminal-cell shape: a char grid + a colour
+// buffer, which the word overlay and ANSI emitter share.
+function cellsFromAscii(f) {
+  return {
+    cols: f.cols,
+    rows: f.rows,
+    chars: f.text.split('\n').map((l) => l.split('')),
+    colors: Buffer.from(f.colors, 'base64')
+  };
+}
+
+// Pack 2x4 subcells into one braille char per terminal cell. "Ink" comes from
+// the glyph index the pipeline chose for the subcell: edge glyphs are always
+// ink, fill glyphs by ramp position. Cell colour = average of its 8 subcells.
+const BRAILLE_BITS = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]]; // [y][x]
+
+function cellsFromBraille(f) {
+  const cols = f.cols >> 1;
+  const rows = f.rows >> 2;
+  const glyphs = Buffer.from(f.glyphs, 'base64');
+  const sub = Buffer.from(f.colors, 'base64');
+  const chars = [];
+  const colors = Buffer.alloc(cols * rows * 3);
+  for (let y = 0; y < rows; y++) {
+    const row = [];
+    for (let x = 0; x < cols; x++) {
+      let bits = 0, r = 0, g = 0, b = 0;
+      for (let sy = 0; sy < 4; sy++) {
+        for (let sx = 0; sx < 2; sx++) {
+          const si = (y * 4 + sy) * f.cols + (x * 2 + sx);
+          const gi = glyphs[si];
+          const ink = gi >= atlasInfo.edgeBase ? 1 : gi / (atlasInfo.fillCount - 1);
+          if (ink >= 0.5) bits |= BRAILLE_BITS[sy][sx];
+          r += sub[si * 3]; g += sub[si * 3 + 1]; b += sub[si * 3 + 2];
+        }
+      }
+      row.push(String.fromCharCode(0x2800 + bits));
+      const o = (y * cols + x) * 3;
+      colors[o] = r >> 3; colors[o + 1] = g >> 3; colors[o + 2] = b >> 3;
+    }
+    chars.push(row);
+  }
+  return { cols, rows, chars, colors };
+}
+
 function composeFrame(f, scroll) {
-  // Mutable char grid from the shader output.
-  const chars = f.text.split('\n').map((l) => l.split(''));
-  const colors = Buffer.from(f.colors, 'base64');
+  const cells = f.braille ? cellsFromBraille(f) : cellsFromAscii(f);
+  const chars = cells.chars;
+  const colors = cells.colors;
   const overrides = new Map(); // cellIndex -> [r,g,b] from CSS text colour
 
   if (!opt.noText) {
     // Words arrive in DOM (~reading) order; a per-row cursor stops adjacent
     // words overwriting each other when pixel positions round into the same
     // cells, and guarantees a one-cell gap between them.
-    const cursor = new Int32Array(f.rows);
+    const cursor = new Int32Array(cells.rows);
     for (const w of words) {
       const row = Math.floor((w.y - scroll.sy) / CH);
-      if (row < 0 || row >= f.rows) continue;
+      if (row < 0 || row >= cells.rows) continue;
       const col = Math.max(Math.round((w.x - scroll.sx) / CW), cursor[row]);
-      if (col >= f.cols) continue;
-      for (let i = 0; i < w.t.length && col + i < f.cols; i++) {
+      if (col >= cells.cols) continue;
+      for (let i = 0; i < w.t.length && col + i < cells.cols; i++) {
         chars[row][col + i] = w.t[i];
-        overrides.set(row * f.cols + col + i, w.c);
+        overrides.set(row * cells.cols + col + i, w.c);
       }
       const gap = col + w.t.length;
-      if (gap < f.cols) chars[row][gap] = ' '; // blank the separator cell
+      if (gap < cells.cols) chars[row][gap] = ' '; // blank the separator cell
       cursor[row] = gap + 1;
     }
   }
 
-  const height = Math.min(f.rows, grid.rows);
+  const height = Math.min(cells.rows, grid.rows);
   const out = [];
   for (let y = 0; y < height; y++) {
     let line = '';
@@ -270,9 +352,9 @@ function composeFrame(f, scroll) {
       line = chars[y].join('');
     } else {
       let last = '';
-      for (let x = 0; x < f.cols; x++) {
-        const ov = overrides.get(y * f.cols + x);
-        const o = (y * f.cols + x) * 3;
+      for (let x = 0; x < cells.cols; x++) {
+        const ov = overrides.get(y * cells.cols + x);
+        const o = (y * cells.cols + x) * 3;
         const c = ov
           ? '\x1b[38;2;' + ov[0] + ';' + ov[1] + ';' + ov[2] + 'm'
           : '\x1b[38;2;' + colors[o] + ';' + colors[o + 1] + ';' + colors[o + 2] + 'm';
@@ -288,8 +370,8 @@ function composeFrame(f, scroll) {
 
 function draw(f, scroll) {
   const rowsOut = composeFrame(f, scroll);
-  const status = '\x1b[7m ' + url.slice(0, Math.max(10, grid.cols - 46)) +
-    ' | q quit · click · scroll · t text · i invert \x1b[0m';
+  const status = '\x1b[7m ' + url.slice(0, Math.max(10, grid.cols - 56)) +
+    ' | q quit · click · scroll · t text · i invert · b braille \x1b[0m';
   process.stdout.write('\x1b[H' + rowsOut.map((l) => l + '\x1b[K\n').join('') + status + '\x1b[K');
 }
 
@@ -351,6 +433,7 @@ if (process.stdin.isTTY) {
     else if (s === 'G') page.evaluate(() => window.scrollTo(0, 1e9)).catch(() => {});
     else if (s === 't') { opt.noText = !opt.noText; redraw(); }
     else if (s === 'i') { opt.invert = !opt.invert; redraw(); }
+    else if (s === 'b') { opt.braille = !opt.braille; redraw(); }
   });
 }
 
