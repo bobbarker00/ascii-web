@@ -17,7 +17,7 @@
 //
 // Usage:
 //   ascii-browse <url> [--cell 8] [--threshold 0.08] [--fps 10]
-//                      [--mono] [--invert] [--no-text] [--hidpi]
+//                      [--mono] [--gray] [--invert] [--no-text] [--hidpi]
 //                      [--braille] [--sound] [--once]
 //
 // --invert  flips the fill ramp ("paper mode"): right for mostly-white sites.
@@ -32,11 +32,12 @@
 //           and audio plays normally. (Headless Chrome has no audio path.)
 // --once    renders a single frame to stdout and exits (no TTY needed).
 //
-// Keys (normal mode): q quit · f link hints (type the label to click; works
-// on links/buttons/inputs — selecting an input enters insert mode) · e insert
-// mode (keys forward to the page; Esc exits) · H/L history back/forward ·
-// wheel/↑↓/PgUp/PgDn/space scroll · g/G top/bottom · t text overlay ·
-// i invert · b braille. Mouse click/wheel work in every mode.
+// Keys (normal mode): q quit · o open URL · f link hints (type the label to
+// click; works on links/buttons/inputs — selecting an input enters insert
+// mode) · e insert mode (keys forward to the page; Esc exits) · H/L history
+// back/forward · wheel/↑↓/PgUp/PgDn/space scroll · g/G top/bottom · t text
+// overlay · i invert · b braille · c cycle colour/grayscale/mono. Mouse
+// click/wheel work in every mode.
 
 import puppeteer from 'puppeteer-core';
 import { readFileSync } from 'node:fs';
@@ -51,13 +52,14 @@ const PIPELINE_FILES = ['glyph-atlas.js', 'shaders.js', 'ascii-renderer.js'];
 const argv = process.argv.slice(2);
 const opt = {
   cell: 8, threshold: 0.08, fps: 10,
-  mono: false, invert: false, noText: false, hidpi: false,
+  mono: false, gray: false, invert: false, noText: false, hidpi: false,
   braille: false, sound: false, once: false
 };
 let url = null;
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a === '--mono') opt.mono = true;
+  else if (a === '--gray') opt.gray = true;
   else if (a === '--invert') opt.invert = true;
   else if (a === '--no-text') opt.noText = true;
   else if (a === '--hidpi') opt.hidpi = true;
@@ -82,6 +84,8 @@ if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(url)) url = 'https://' + url;
 // half-width subcells at least 2px wide.
 if (opt.cell % 2) opt.cell += 1;
 if (opt.braille && opt.cell < 4) opt.cell = 4;
+// 'color' | 'gray' | 'mono' — cycled at runtime with 'c'.
+opt.colorMode = opt.mono ? 'mono' : (opt.gray ? 'gray' : 'color');
 
 // ---- find a Chrome ----------------------------------------------------------
 function chromePath() {
@@ -207,9 +211,13 @@ async function setTextHidden(hidden) {
   }, hidden).catch(() => {});
 }
 await setTextHidden(!opt.noText);
-// Navigations wipe injected styles; re-apply.
+// Navigations wipe injected styles; re-apply. Also keep the status-bar URL
+// honest — clicks and hint-follows navigate without going through goto().
 page.on('framenavigated', (fr) => {
-  if (!fr.parentFrame()) setTextHidden(!opt.noText);
+  if (!fr.parentFrame()) {
+    url = fr.url();
+    setTextHidden(!opt.noText);
+  }
 });
 
 // ---- frame conversion (runs in the renderer tab) ------------------------------
@@ -262,6 +270,34 @@ async function extractText() {
     const out = [];
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
     const range = document.createRange();
+
+    // Effective background: nearest ancestor with a non-transparent
+    // background-color. Only reported when it differs from the page's base
+    // background — that targets buttons/cards/highlights without giving
+    // every paragraph a solid slab.
+    const bgCache = new Map();
+    function effBg(start) {
+      if (bgCache.has(start)) return bgCache.get(start);
+      let n = start;
+      let v = null;
+      while (n && n !== document.documentElement) {
+        const p = /rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?/.exec(getComputedStyle(n).backgroundColor);
+        if (p && (p[4] === undefined || +p[4] > 0.5)) { v = [+p[1], +p[2], +p[3]]; break; }
+        n = n.parentElement;
+      }
+      bgCache.set(start, v);
+      return v;
+    }
+    const baseP = document.body &&
+      /rgba?\((\d+),\s*(\d+),\s*(\d+)/.exec(getComputedStyle(document.body).backgroundColor);
+    const baseBg = baseP ? [+baseP[1], +baseP[2], +baseP[3]] : [255, 255, 255];
+    function distinctBg(el) {
+      const bg = effBg(el);
+      if (!bg) return null;
+      const d = Math.abs(bg[0] - baseBg[0]) + Math.abs(bg[1] - baseBg[1]) + Math.abs(bg[2] - baseBg[2]);
+      return d >= 48 ? bg : null;
+    }
+
     let node;
     while ((node = walker.nextNode())) {
       const s = node.nodeValue;
@@ -284,7 +320,7 @@ async function extractText() {
         range.setEnd(node, m.index + m[0].length);
         const r = range.getBoundingClientRect();
         if (r.width === 0 || r.height === 0) continue;
-        out.push({ t: m[0], x: r.left + scrollX, y: r.top + scrollY + r.height / 2, c: col, b: bold, u: link, fs: parseFloat(cs.fontSize) });
+        out.push({ t: m[0], x: r.left + scrollX, y: r.top + scrollY + r.height / 2, c: col, b: bold, u: link, fs: parseFloat(cs.fontSize), bg: distinctBg(el) });
         if (out.length >= 8000) return out; // safety cap on huge pages
       }
     }
@@ -307,7 +343,8 @@ async function extractText() {
         c: m2 ? [+m2[1], +m2[2], +m2[3]] : [220, 220, 220],
         b: 0,
         u: 0,
-        fs: parseFloat(cs.fontSize)
+        fs: parseFloat(cs.fontSize),
+        bg: distinctBg(el)
       });
     });
     return out;
@@ -316,7 +353,10 @@ async function extractText() {
 
   // Dark CSS text (e.g. Wikipedia body copy) is invisible on a dark terminal:
   // lift low-luminance colours most of the way to white, keeping some hue.
+  // Words with their own background keep true colours — dark-on-light there
+  // is the intended contrast.
   for (const w of raw) {
+    if (w.bg) continue;
     const luma = 0.299 * w.c[0] + 0.587 * w.c[1] + 0.114 * w.c[2];
     if (luma < 120) {
       w.c = w.c.map((v) => Math.round(v + (255 - v) * 0.75));
@@ -344,9 +384,11 @@ async function extractText() {
 // ---- modes ----------------------------------------------------------------------
 // normal: browse keys. insert: keys forward to the page (Esc exits).
 // hint: visible clickables wear labels; typing a label clicks it.
+// url: the status bar becomes an address input (Enter navigates).
 let mode = 'normal';
 let hints = [];     // [{ label, x, y }] in document CSS pixels
 let hintPrefix = '';
+let urlInput = '';
 
 const HINT_ALPHABET = 'asdfghjklqwertyuiopzxcvbnm';
 
@@ -517,7 +559,10 @@ function composeFrame(f, scroll) {
         const ideal = Math.round((w.x - scroll.sx) / CW);
         const col = Math.max(ideal, cursor);
         if (col >= cells.cols) continue;
-        if (col - 1 >= cursor && col - 1 >= 0) chars[row][col - 1] = ' '; // pad before
+        if (col - 1 >= cursor && col - 1 >= 0) {
+          chars[row][col - 1] = ' '; // pad before
+          if (w.bg) overrides.set(row * cells.cols + col - 1, w); // extend bg pill
+        }
         let end = col;
         for (let i = 0; i < w.t.length; i++) {
           const cc = col + i * gw;
@@ -532,7 +577,10 @@ function composeFrame(f, scroll) {
           overrides.set(row * cells.cols + cc, w);
           end = cc + gw;
         }
-        if (end < cells.cols) chars[row][end] = ' '; // blank the separator cell
+        if (end < cells.cols) {
+          chars[row][end] = ' '; // blank the separator cell
+          if (w.bg) overrides.set(row * cells.cols + end, w); // extend bg pill
+        }
         cursor = end + 1;
       }
     }
@@ -557,21 +605,34 @@ function composeFrame(f, scroll) {
   const out = [];
   for (let y = 0; y < height; y++) {
     let line = '';
-    if (opt.mono) {
+    if (opt.colorMode === 'mono') {
       line = chars[y].join('');
     } else {
+      const gray = opt.colorMode === 'gray';
+      const grayOf = (v) => {
+        const l = Math.round(0.299 * v[0] + 0.587 * v[1] + 0.114 * v[2]);
+        return [l, l, l];
+      };
       let last = '';
       for (let x = 0; x < cells.cols; x++) {
         const ov = overrides.get(y * cells.cols + x);
         const o = (y * cells.cols + x) * 3;
-        // Self-contained style per run: leading 0 resets bold/underline from
-        // the previous run, then colour, then this run's attributes.
-        const c = ov
-          ? (ov.hint
-            ? '\x1b[0;30;103m' // hint label: black on bright yellow
-            : '\x1b[0;38;2;' + ov.c[0] + ';' + ov.c[1] + ';' + ov.c[2] +
-              (ov.b ? ';1' : '') + (ov.u ? ';4' : '') + 'm')
-          : '\x1b[0;38;2;' + colors[o] + ';' + colors[o + 1] + ';' + colors[o + 2] + 'm';
+        // Self-contained style per run: leading 0 resets attributes from the
+        // previous run, then colour, then this run's attributes/background.
+        let c;
+        if (ov && ov.hint) {
+          c = '\x1b[0;30;103m'; // hint label: black on bright yellow
+        } else {
+          let fg = ov ? ov.c : [colors[o], colors[o + 1], colors[o + 2]];
+          let bg = (ov && ov.bg) || null;
+          if (gray) {
+            fg = grayOf(fg);
+            if (bg) bg = grayOf(bg);
+          }
+          c = '\x1b[0;38;2;' + fg[0] + ';' + fg[1] + ';' + fg[2] +
+            (ov && ov.b ? ';1' : '') + (ov && ov.u ? ';4' : '') +
+            (bg ? ';48;2;' + bg[0] + ';' + bg[1] + ';' + bg[2] : '') + 'm';
+        }
         if (c !== last) { line += c; last = c; } // only emit style changes
         line += chars[y][x];
       }
@@ -590,12 +651,17 @@ let prevStatus = '';
 
 function draw(f, scroll) {
   const rowsOut = composeFrame(f, scroll);
-  let help;
-  if (mode === 'insert') help = ' -- INSERT -- keys go to the page · Esc back ';
-  else if (mode === 'hint') help = ' -- LINKS ' + hintPrefix + ' -- type a label · Esc cancel ';
-  else help = ' | q quit · f links · e type · H/L back/fwd · t/i/b modes ';
-  const status = '\x1b[7m ' + url.slice(0, Math.max(10, grid.cols - help.length - 2)) +
-    help + '\x1b[0m';
+  let status;
+  if (mode === 'url') {
+    status = '\x1b[7m Open: ' + urlInput + '▏ — Enter go · Esc cancel \x1b[0m';
+  } else {
+    let help;
+    if (mode === 'insert') help = ' -- INSERT -- keys go to the page · Esc back ';
+    else if (mode === 'hint') help = ' -- LINKS ' + hintPrefix + ' -- type a label · Esc cancel ';
+    else help = ' | q quit · o url · f links · e type · H/L hist · c colour · t/i/b ';
+    status = '\x1b[7m ' + url.slice(0, Math.max(10, grid.cols - help.length - 2)) +
+      help + '\x1b[0m';
+  }
   let out = '';
   for (let y = 0; y < rowsOut.length; y++) {
     if (rowsOut[y] !== prevRows[y]) {
@@ -671,6 +737,27 @@ if (process.stdin.isTTY) {
       return;
     }
 
+    if (mode === 'url') {
+      if (s === '\x1b') { mode = 'normal'; redraw(); return; }
+      for (const ch of s) {
+        if (ch === '\r') {
+          let target = urlInput.trim();
+          mode = 'normal';
+          if (target) {
+            if (!/^[a-z][a-z0-9+.-]*:/i.test(target)) target = 'https://' + target;
+            url = target;
+            page.goto(target, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+          }
+          redraw();
+          return;
+        }
+        if (ch === '\x7f' || ch === '\b') urlInput = urlInput.slice(0, -1);
+        else if (ch >= ' ') urlInput += ch;
+      }
+      redraw();
+      return;
+    }
+
     if (mode === 'hint') {
       if (s === '\x1b') { mode = 'normal'; hintPrefix = ''; redraw(); return; }
       for (const ch of s) {
@@ -700,6 +787,12 @@ if (process.stdin.isTTY) {
     else if (s === 'G') page.evaluate(() => window.scrollTo(0, 1e9)).catch(() => {});
     else if (s === 'f') startHints();
     else if (s === 'e') { mode = 'insert'; redraw(); }
+    else if (s === 'o') { mode = 'url'; urlInput = ''; redraw(); }
+    else if (s === 'c') {
+      const order = ['color', 'gray', 'mono'];
+      opt.colorMode = order[(order.indexOf(opt.colorMode) + 1) % order.length];
+      redraw();
+    }
     else if (s === 'H') page.goBack().catch(() => {});
     else if (s === 'L') page.goForward().catch(() => {});
     else if (s === 't') { opt.noText = !opt.noText; setTextHidden(!opt.noText); redraw(); }

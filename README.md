@@ -46,7 +46,7 @@ four edge glyphs. The shader navigates it by index.
 | `src/background.js` | MV3 service worker: fetches cross-origin image bytes on request (extension fetches bypass page CORS via `host_permissions`). |
 | `popup.html` / `popup.js` | Toggle + cell size / edge strength / colour controls. Writes to `chrome.storage.local`; the content script reacts live. |
 | `test/index.html` | Self-contained test page (orientation, diagonals, live video, CORS cases). Serve with `python3 -m http.server 8123 -d test`, don't open via `file://`. |
-| `cli/ascii-browse.mjs` | Terminal frontend: headless Chrome + screenshot polling (unchanged frames skipped), the same three pipeline files convert frames via `readCells()`, page text is stamped back over the art as real readable characters (DOM text layer). Fully keyboard-navigable: `f` link hints (type the label to click), `e` insert mode (keys forward to the page, Esc exits), `H`/`L` history, arrows/PgUp/PgDn scroll; mouse click/wheel also work. `npm install` in `cli/` once, then `node cli/ascii-browse.mjs <url>` (`--mono`, `--invert`, `--no-text`, `--hidpi`, `--braille` for 8x dot-matrix detail, `--sound` (experimental), `--cell N`, `--fps N`, `--once`). |
+| `cli/ascii-browse.mjs` | Terminal frontend: headless Chrome + screenshot polling (unchanged frames skipped), the same three pipeline files convert frames via `readCells()`, page text is stamped back over the art as real readable characters (DOM text layer). Fully keyboard-navigable: `o` URL bar, `f` link hints (type the label to click), `e` insert mode (keys forward to the page, Esc exits), `H`/`L` history, `c` colour/grayscale/mono cycle, arrows/PgUp/PgDn scroll; mouse click/wheel also work. Text stamps carry their element's real background when it differs from the page base (buttons/cards read as buttons/cards). `npm install` in `cli/` once, then `node cli/ascii-browse.mjs <url>` (`--mono`, `--invert`, `--no-text`, `--hidpi`, `--braille` for 8x dot-matrix detail, `--sound` (experimental), `--cell N`, `--fps N`, `--once`). |
 
 One shared renderer feeds many cheap 2D-canvas overlays (browsers cap WebGL
 contexts at ~16, and a page can have more images than that).
@@ -103,9 +103,7 @@ Load Temporary Add-on → pick `manifest.json`.
 
 ## Next steps (good tasks to hand to Claude Code)
 
-- Terminal frontend polish: a URL bar (`o` to open a new address), font-size
-  aware text stamping (headlines currently render at one cell height),
-  background-colour awareness for text regions (buttons/cards).
+- Terminal frontend polish: tab support, find-in-page, configurable keymap.
 - True-pixel media: render image/video boxes via the kitty graphics protocol
   or sixel in supporting terminals, keeping ASCII/braille as the fallback.
 - Proper sound: the current `--sound` (headful window) is a stopgap; a real
