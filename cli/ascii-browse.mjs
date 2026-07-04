@@ -284,7 +284,7 @@ async function extractText() {
         range.setEnd(node, m.index + m[0].length);
         const r = range.getBoundingClientRect();
         if (r.width === 0 || r.height === 0) continue;
-        out.push({ t: m[0], x: r.left + scrollX, y: r.top + scrollY + r.height / 2, c: col, b: bold, u: link });
+        out.push({ t: m[0], x: r.left + scrollX, y: r.top + scrollY + r.height / 2, c: col, b: bold, u: link, fs: parseFloat(cs.fontSize) });
         if (out.length >= 8000) return out; // safety cap on huge pages
       }
     }
@@ -306,7 +306,8 @@ async function extractText() {
         y: r.top + scrollY + r.height / 2,
         c: m2 ? [+m2[1], +m2[2], +m2[3]] : [220, 220, 220],
         b: 0,
-        u: 0
+        u: 0,
+        fs: parseFloat(cs.fontSize)
       });
     });
     return out;
@@ -422,6 +423,15 @@ async function forwardKeys(s) {
 }
 
 // ---- drawing ------------------------------------------------------------------
+// ASCII 0x21-0x7E have fullwidth twins at +0xFEE0; they occupy two terminal
+// cells, which is how headline-sized text gets rendered physically bigger.
+function toFullwidth(ch) {
+  const c = ch.charCodeAt(0);
+  if (c >= 0x21 && c <= 0x7e) return String.fromCharCode(c + 0xfee0);
+  if (ch === ' ') return '　';
+  return ch;
+}
+
 // Both modes reduce to the same terminal-cell shape: a char grid + a colour
 // buffer, which the word overlay and ANSI emitter share.
 function cellsFromAscii(f) {
@@ -499,17 +509,31 @@ function composeFrame(f, scroll) {
       // the middle of a sentence).
       let cursor = 0;
       for (const w of ln.words) {
+        // Headline-sized text renders as fullwidth forms (２ cells per char,
+        // universally supported) — a terminal can't scale fonts, but it can
+        // make big text physically bigger this way.
+        const big = w.fs >= Math.max(20, CH * 1.3);
+        const gw = big ? 2 : 1;
         const ideal = Math.round((w.x - scroll.sx) / CW);
         const col = Math.max(ideal, cursor);
         if (col >= cells.cols) continue;
         if (col - 1 >= cursor && col - 1 >= 0) chars[row][col - 1] = ' '; // pad before
-        for (let i = 0; i < w.t.length && col + i < cells.cols; i++) {
-          chars[row][col + i] = w.t[i];
-          overrides.set(row * cells.cols + col + i, w);
+        let end = col;
+        for (let i = 0; i < w.t.length; i++) {
+          const cc = col + i * gw;
+          if (cc + gw > cells.cols) break;
+          if (big) {
+            chars[row][cc] = toFullwidth(w.t[i]);
+            chars[row][cc + 1] = ''; // covered by the wide glyph
+            overrides.set(row * cells.cols + cc + 1, w);
+          } else {
+            chars[row][cc] = w.t[i];
+          }
+          overrides.set(row * cells.cols + cc, w);
+          end = cc + gw;
         }
-        const gap = col + w.t.length;
-        if (gap < cells.cols) chars[row][gap] = ' '; // blank the separator cell
-        cursor = gap + 1;
+        if (end < cells.cols) chars[row][end] = ' '; // blank the separator cell
+        cursor = end + 1;
       }
     }
   }
