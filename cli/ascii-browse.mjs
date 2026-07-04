@@ -32,9 +32,11 @@
 //           and audio plays normally. (Headless Chrome has no audio path.)
 // --once    renders a single frame to stdout and exits (no TTY needed).
 //
-// Keys: q quit · mouse click = click the page · wheel/↑↓/PgUp/PgDn/space
-// scroll (real wheel events, so container/modal scrolling works) · g/G
-// top/bottom · t toggle text overlay · i toggle invert · b toggle braille.
+// Keys (normal mode): q quit · f link hints (type the label to click; works
+// on links/buttons/inputs — selecting an input enters insert mode) · e insert
+// mode (keys forward to the page; Esc exits) · H/L history back/forward ·
+// wheel/↑↓/PgUp/PgDn/space scroll · g/G top/bottom · t text overlay ·
+// i invert · b braille. Mouse click/wheel work in every mode.
 
 import puppeteer from 'puppeteer-core';
 import { readFileSync } from 'node:fs';
@@ -286,6 +288,27 @@ async function extractText() {
         if (out.length >= 8000) return out; // safety cap on huge pages
       }
     }
+    // Form fields: their values/placeholders aren't text nodes, so the walk
+    // above never sees them — without this, typing would be invisible. The
+    // focused field gets a caret mark.
+    document.querySelectorAll('input, textarea').forEach((el) => {
+      const r = el.getBoundingClientRect();
+      if (!r.width || !r.height) return;
+      const cs = getComputedStyle(el);
+      if (cs.visibility === 'hidden' || cs.display === 'none') return;
+      let v = el.value || el.placeholder || '';
+      if (el === document.activeElement) v += '▏';
+      if (!v) return;
+      const m2 = /rgba?\((\d+),\s*(\d+),\s*(\d+)/.exec(cs.color);
+      out.push({
+        t: v.slice(0, 200),
+        x: r.left + scrollX + 2,
+        y: r.top + scrollY + r.height / 2,
+        c: m2 ? [+m2[1], +m2[2], +m2[3]] : [220, 220, 220],
+        b: 0,
+        u: 0
+      });
+    });
     return out;
   }).catch(() => null);
   if (!raw) return; // mid-navigation; keep the old words until the next pass
@@ -315,6 +338,87 @@ async function extractText() {
   }
   for (const ln of lines) ln.words.sort((a, b) => a.x - b.x);
   textLines = lines;
+}
+
+// ---- modes ----------------------------------------------------------------------
+// normal: browse keys. insert: keys forward to the page (Esc exits).
+// hint: visible clickables wear labels; typing a label clicks it.
+let mode = 'normal';
+let hints = [];     // [{ label, x, y }] in document CSS pixels
+let hintPrefix = '';
+
+const HINT_ALPHABET = 'asdfghjklqwertyuiopzxcvbnm';
+
+async function startHints() {
+  const found = await page.evaluate(() => {
+    const els = document.querySelectorAll(
+      'a[href], button, input, select, textarea, [role="button"], [contenteditable="true"]');
+    const out = [];
+    for (const el of els) {
+      const r = el.getBoundingClientRect();
+      if (!r.width || !r.height) continue;
+      if (r.bottom < 0 || r.top > innerHeight || r.right < 0 || r.left > innerWidth) continue;
+      const cs = getComputedStyle(el);
+      if (cs.visibility === 'hidden' || cs.display === 'none') continue;
+      out.push({ x: r.left + r.width / 2 + scrollX, y: r.top + r.height / 2 + scrollY });
+      if (out.length >= 400) break;
+    }
+    return out;
+  }).catch(() => []);
+  found.forEach((h, i) => {
+    h.label = found.length <= HINT_ALPHABET.length
+      ? HINT_ALPHABET[i]
+      : HINT_ALPHABET[(i / HINT_ALPHABET.length) | 0] + HINT_ALPHABET[i % HINT_ALPHABET.length];
+  });
+  hints = found;
+  hintPrefix = '';
+  mode = found.length ? 'hint' : 'normal';
+  redraw();
+}
+
+async function clickHint(h) {
+  const sc = await page.evaluate(() => ({ sx: scrollX, sy: scrollY })).catch(() => null);
+  if (!sc) return;
+  await page.mouse.click(h.x - sc.sx, h.y - sc.sy).catch(() => {});
+  // Landing on an editable element goes straight to insert mode.
+  setTimeout(async () => {
+    const editable = await page.evaluate(() => {
+      const el = document.activeElement;
+      return !!el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
+    }).catch(() => false);
+    if (editable) { mode = 'insert'; redraw(); }
+  }, 150);
+}
+
+// Forward a raw stdin chunk to the page as keystrokes.
+const KEY_SEQS = [
+  ['\x1b[A', 'ArrowUp'], ['\x1b[B', 'ArrowDown'],
+  ['\x1b[C', 'ArrowRight'], ['\x1b[D', 'ArrowLeft'],
+  ['\x1b[3~', 'Delete'], ['\x1b[H', 'Home'], ['\x1b[F', 'End']
+];
+
+async function forwardKeys(s) {
+  let run = '';
+  const flush = async () => {
+    if (run) { const r = run; run = ''; await page.keyboard.type(r).catch(() => {}); }
+  };
+  let i = 0;
+  outer: while (i < s.length) {
+    for (const [seq, key] of KEY_SEQS) {
+      if (s.startsWith(seq, i)) {
+        await flush();
+        await page.keyboard.press(key).catch(() => {});
+        i += seq.length;
+        continue outer;
+      }
+    }
+    const ch = s[i++];
+    if (ch === '\r') { await flush(); await page.keyboard.press('Enter').catch(() => {}); }
+    else if (ch === '\x7f' || ch === '\b') { await flush(); await page.keyboard.press('Backspace').catch(() => {}); }
+    else if (ch === '\t') { await flush(); await page.keyboard.press('Tab').catch(() => {}); }
+    else if (ch >= ' ') run += ch;
+  }
+  await flush();
 }
 
 // ---- drawing ------------------------------------------------------------------
@@ -410,6 +514,21 @@ function composeFrame(f, scroll) {
     }
   }
 
+  // Hint labels stamp last, over everything, in a loud style.
+  if (mode === 'hint') {
+    for (const h of hints) {
+      if (hintPrefix && !h.label.startsWith(hintPrefix)) continue;
+      const row = Math.floor((h.y - scroll.sy) / CH);
+      const col = Math.round((h.x - scroll.sx) / CW);
+      if (row < 0 || row >= cells.rows) continue;
+      for (let i = 0; i < h.label.length && col + i < cells.cols; i++) {
+        if (col + i < 0) continue;
+        chars[row][col + i] = h.label[i].toUpperCase();
+        overrides.set(row * cells.cols + col + i, { hint: true });
+      }
+    }
+  }
+
   const height = Math.min(cells.rows, grid.rows);
   const out = [];
   for (let y = 0; y < height; y++) {
@@ -424,8 +543,10 @@ function composeFrame(f, scroll) {
         // Self-contained style per run: leading 0 resets bold/underline from
         // the previous run, then colour, then this run's attributes.
         const c = ov
-          ? '\x1b[0;38;2;' + ov.c[0] + ';' + ov.c[1] + ';' + ov.c[2] +
-            (ov.b ? ';1' : '') + (ov.u ? ';4' : '') + 'm'
+          ? (ov.hint
+            ? '\x1b[0;30;103m' // hint label: black on bright yellow
+            : '\x1b[0;38;2;' + ov.c[0] + ';' + ov.c[1] + ';' + ov.c[2] +
+              (ov.b ? ';1' : '') + (ov.u ? ';4' : '') + 'm')
           : '\x1b[0;38;2;' + colors[o] + ';' + colors[o + 1] + ';' + colors[o + 2] + 'm';
         if (c !== last) { line += c; last = c; } // only emit style changes
         line += chars[y][x];
@@ -445,8 +566,12 @@ let prevStatus = '';
 
 function draw(f, scroll) {
   const rowsOut = composeFrame(f, scroll);
-  const status = '\x1b[7m ' + url.slice(0, Math.max(10, grid.cols - 56)) +
-    ' | q quit · click · scroll · t text · i invert · b braille \x1b[0m';
+  let help;
+  if (mode === 'insert') help = ' -- INSERT -- keys go to the page · Esc back ';
+  else if (mode === 'hint') help = ' -- LINKS ' + hintPrefix + ' -- type a label · Esc cancel ';
+  else help = ' | q quit · f links · e type · H/L back/fwd · t/i/b modes ';
+  const status = '\x1b[7m ' + url.slice(0, Math.max(10, grid.cols - help.length - 2)) +
+    help + '\x1b[0m';
   let out = '';
   for (let y = 0; y < rowsOut.length; y++) {
     if (rowsOut[y] !== prevRows[y]) {
@@ -512,14 +637,47 @@ if (process.stdin.isTTY) {
       else if (btn === 65) wheel(CH * 3);    // wheel down
     }
     s = s.replace(/\x1b\[<\d+;\d+;\d+[Mm]/g, '');
+    if (!s) return;
 
-    if (s.includes('q') || s.includes('\x03')) return quit(0);
+    if (s.includes('\x03')) return quit(0); // Ctrl-C always quits
+
+    if (mode === 'insert') {
+      if (s === '\x1b') { mode = 'normal'; redraw(); return; } // bare Esc
+      forwardKeys(s);
+      return;
+    }
+
+    if (mode === 'hint') {
+      if (s === '\x1b') { mode = 'normal'; hintPrefix = ''; redraw(); return; }
+      for (const ch of s) {
+        if (HINT_ALPHABET.includes(ch)) hintPrefix += ch;
+      }
+      const exact = hints.find((h) => h.label === hintPrefix);
+      const partial = hints.some((h) => h.label.startsWith(hintPrefix));
+      if (exact) {
+        mode = 'normal';
+        hintPrefix = '';
+        clickHint(exact);
+      } else if (!partial) {
+        mode = 'normal';
+        hintPrefix = '';
+      }
+      redraw();
+      return;
+    }
+
+    // normal mode
+    if (s.includes('q')) return quit(0);
     if (s.includes('\x1b[A')) wheel(-CH * 3);            // up
     else if (s.includes('\x1b[B')) wheel(CH * 3);        // down
     else if (s.includes('\x1b[5~')) wheel(-pageH);       // PgUp
     else if (s.includes('\x1b[6~') || s === ' ') wheel(pageH); // PgDn / space
     else if (s === 'g') page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
     else if (s === 'G') page.evaluate(() => window.scrollTo(0, 1e9)).catch(() => {});
+    else if (s === 'f') startHints();
+    else if (s === 'e') { mode = 'insert'; redraw(); }
+    else if (s === 'H') page.goBack().catch(() => {});
+    else if (s === 'L') page.goForward().catch(() => {});
     else if (s === 't') { opt.noText = !opt.noText; setTextHidden(!opt.noText); redraw(); }
     else if (s === 'i') { opt.invert = !opt.invert; redraw(); }
     else if (s === 'b') { opt.braille = !opt.braille; redraw(); }
@@ -562,9 +720,12 @@ while (!quitting) {
   } catch (e) {
     // Mid-navigation capture race; keep the last frame and try again.
   }
-  if (!opt.noText && Date.now() - lastExtract > 1000) {
+  // Insert mode refreshes faster so typed field values show promptly — and
+  // must force the redraw itself: the page's own text is transparent in the
+  // capture, so typing never trips the screenshot change-detector.
+  if (!opt.noText && Date.now() - lastExtract > (mode === 'insert' ? 250 : 1000)) {
     lastExtract = Date.now();
-    extractText(); // fire and forget; stamps land on the next frame
+    extractText().then(() => { if (mode === 'insert') redraw(); });
   }
   await sleep(Math.max(20, 1000 / opt.fps - (Date.now() - t0)));
 }
