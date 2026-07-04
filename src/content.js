@@ -14,7 +14,8 @@
     enabled: false,
     cellSize: 8,
     color: false,
-    edgeThreshold: 0.08
+    edgeThreshold: 0.08,
+    textMode: false
   };
 
   const MIN_SIZE = 64;       // ignore tiny icons/sprites
@@ -85,17 +86,38 @@
     this.isVideo = el.tagName === 'VIDEO';
     this.raf = 0;
     this.lastSize = '';
-    this.animating = false; // true once an ImageDecoder loop owns this canvas
+    this.animating = false; // true once an ImageDecoder loop owns this overlay
     this.decoder = null;
+    this.textMode = !!settings.textMode;
+    this.renderW = 1; // backing pixel size to render at
+    this.renderH = 1;
+    this.lastCols = 0;
+    this.lastRows = 0;
 
-    const c = document.createElement('canvas');
-    c.style.position = 'absolute';
-    c.style.pointerEvents = 'none';
-    c.style.zIndex = '2147483646';
-    c.style.imageRendering = 'pixelated';
-    document.body.appendChild(c);
-    this.canvas = c;
-    this.ctx = c.getContext('2d');
+    let node;
+    if (this.textMode) {
+      // Real, selectable characters. Note: unlike the canvas, the <pre> takes
+      // pointer events so the text can be selected — it covers the element.
+      node = document.createElement('pre');
+      node.style.margin = '0';
+      node.style.overflow = 'hidden';
+      node.style.background = '#0a0a0a';
+      node.style.color = '#d9f2d9';
+      node.style.fontFamily = 'monospace';
+      node.style.letterSpacing = '0';
+      node.style.userSelect = 'text';
+      this.pre = node;
+    } else {
+      node = document.createElement('canvas');
+      node.style.pointerEvents = 'none';
+      node.style.imageRendering = 'pixelated';
+      this.canvas = node;
+      this.ctx = node.getContext('2d');
+    }
+    node.style.position = 'absolute';
+    node.style.zIndex = '2147483646';
+    document.body.appendChild(node);
+    this.node = node;
 
     this.position();
     if (this.isVideo) this.loop();
@@ -104,11 +126,11 @@
 
   Overlay.prototype.position = function () {
     const r = this.el.getBoundingClientRect();
-    const c = this.canvas;
-    c.style.left = (r.left + window.scrollX) + 'px';
-    c.style.top = (r.top + window.scrollY) + 'px';
-    c.style.width = r.width + 'px';
-    c.style.height = r.height + 'px';
+    const n = this.node;
+    n.style.left = (r.left + window.scrollX) + 'px';
+    n.style.top = (r.top + window.scrollY) + 'px';
+    n.style.width = r.width + 'px';
+    n.style.height = r.height + 'px';
 
     // Backing resolution at device pixel ratio for crisp glyphs.
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -116,13 +138,43 @@
     const h = Math.max(1, Math.round(r.height * dpr));
     const key = w + 'x' + h;
     if (key !== this.lastSize) {
-      c.width = w;
-      c.height = h;
       this.lastSize = key;
+      this.renderW = w;
+      this.renderH = h;
+      if (this.canvas) {
+        this.canvas.width = w;
+        this.canvas.height = h;
+      }
       if (!this.isVideo) this.renderImage();
     }
     // Hide overlay if the element is off-screen or zero-sized.
-    c.style.display = (r.width < 1 || r.height < 1) ? 'none' : 'block';
+    n.style.display = (r.width < 1 || r.height < 1) ? 'none' : 'block';
+  };
+
+  // Render any source (element or ImageBitmap) into this overlay, honouring
+  // its mode: composite to the canvas, or read cells back and fill the <pre>.
+  Overlay.prototype.renderSource = function (src) {
+    const r = getRenderer();
+    if (!r) return false;
+    if (!this.textMode) {
+      return r.render(src, this.renderW, this.renderH, this.ctx, settings);
+    }
+    // ~1:2 cells to match monospace glyph shape.
+    const grid = r.readCells(src, this.renderW, this.renderH,
+      Object.assign({}, settings, { cellAspect: 2 }));
+    if (!grid) return false;
+    this.pre.textContent = grid.text;
+    if (grid.cols !== this.lastCols || grid.rows !== this.lastRows) {
+      // Fit the character grid to the element's CSS box.
+      const rect = this.el.getBoundingClientRect();
+      const cellW = rect.width / grid.cols;
+      // Monospace advance is ~0.6em, so this makes a char ~cellW wide.
+      this.pre.style.fontSize = (cellW / 0.6) + 'px';
+      this.pre.style.lineHeight = (rect.height / grid.rows) + 'px';
+      this.lastCols = grid.cols;
+      this.lastRows = grid.rows;
+    }
+    return true;
   };
 
   Overlay.prototype.renderImage = function () {
@@ -133,7 +185,7 @@
       this.el.addEventListener('load', () => this.renderImage(), { once: true });
       return;
     }
-    const ok = r.render(this.el, this.canvas.width, this.canvas.height, this.ctx, settings);
+    const ok = this.renderSource(this.el);
     if (!ok) this.renderFetched();
     this.maybeAnimate();
   };
@@ -146,8 +198,7 @@
     fetchBitmap(url).then((bmp) => {
       if (!bmp || !overlays.has(this.el)) return;          // torn down mid-fetch
       if ((this.el.currentSrc || this.el.src) !== url) return; // src swapped mid-fetch
-      const r = getRenderer();
-      if (r) r.render(bmp, this.canvas.width, this.canvas.height, this.ctx, settings);
+      this.renderSource(bmp);
     });
   };
 
@@ -208,8 +259,7 @@
           // the vertical flip that UNPACK_FLIP_Y won't apply to this source.
           return createImageBitmap(frame, { imageOrientation: 'flipY' }).then((bmp) => {
             frame.close();
-            const r = getRenderer();
-            if (r) r.render(bmp, this.canvas.width, this.canvas.height, this.ctx, settings);
+            this.renderSource(bmp);
             bmp.close();
           });
         })
@@ -224,7 +274,7 @@
     const step = () => {
       this.position();
       if (this.el.readyState >= 2 && !this.el.paused && this.el.videoWidth > 0) {
-        r.render(this.el, this.canvas.width, this.canvas.height, this.ctx, settings);
+        this.renderSource(this.el);
       }
       this.raf = requestAnimationFrame(step);
     };
@@ -242,7 +292,7 @@
       try { this.decoder.close(); } catch (e) { /* already closed */ }
       this.decoder = null;
     }
-    this.canvas.remove();
+    this.node.remove();
   };
 
   // ---- scanning ----
@@ -306,7 +356,12 @@
     if (settings.enabled !== wasEnabled) {
       applyEnabled();
     } else if (settings.enabled) {
-      overlays.forEach((o) => o.refresh()); // re-render images with new params
+      if ('textMode' in changes) {
+        teardown(); // overlay node type changes; rebuild from scratch
+        scan();
+      } else {
+        overlays.forEach((o) => o.refresh()); // re-render images with new params
+      }
     }
   });
 })();

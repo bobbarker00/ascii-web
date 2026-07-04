@@ -157,15 +157,18 @@ out vec4 frag;
 uniform sampler2D u_src;       // full-res source (for luminance / colour)
 uniform sampler2D u_edge;      // full-res edge texture from pass 1
 uniform vec2 u_outTexel;       // 1.0 / full-res output size
-uniform float u_cellSize;      // pixels per character cell
+uniform vec2 u_cellSize;       // pixels per character cell (width, height) —
+                               // rectangular so text mode can match the ~1:2
+                               // aspect of real monospace glyphs
 uniform vec2 u_grid;           // cols, rows
 
-const int MAX_CELL = 24;       // loop cap; keep cellSize <= this
+const int MAX_CELL = 32;       // loop cap; keep cell dimensions <= this
 
 void main() {
   vec2 cell = floor(v_uv * u_grid);
   vec2 originPx = cell * u_cellSize;
-  int cs = int(u_cellSize);
+  int csx = int(u_cellSize.x);
+  int csy = int(u_cellSize.y);
 
   float lumSum = 0.0;
   float cnt = 0.0;
@@ -173,9 +176,9 @@ void main() {
   dirMag[0] = 0.0; dirMag[1] = 0.0; dirMag[2] = 0.0; dirMag[3] = 0.0;
 
   for (int y = 0; y < MAX_CELL; y++) {
-    if (y >= cs) break;
+    if (y >= csy) break;
     for (int x = 0; x < MAX_CELL; x++) {
-      if (x >= cs) break;
+      if (x >= csx) break;
       vec2 px = originPx + vec2(float(x), float(y)) + 0.5;
       vec2 uv = px * u_outTexel;
 
@@ -200,6 +203,19 @@ void main() {
   float energy = (cnt > 0.0) ? best / cnt : 0.0; // 0..1, strength of that direction
 
   frag = vec4(avgLum, clamp(energy, 0.0, 1.0), bestDir / 3.0, 1.0);
+}`;
+
+  // ---- Utility: plain copy ----------------------------------------------------
+  // Used by text-mode readback to downsample the source to one colour per cell
+  // (the canvas path gets its per-cell colour the same way, by sampling the
+  // source at the cell centre inside COMP_FRAG).
+  const COPY_FRAG = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+out vec4 frag;
+uniform sampler2D u_src;
+void main() {
+  frag = texture(u_src, v_uv);
 }`;
 
   // ---- Pass 5: composite -----------------------------------------------------
@@ -257,6 +273,7 @@ void main() {
     VERT: VERT,
     BLURX_FRAG: BLURX_FRAG,
     BLURY_FRAG: BLURY_FRAG,
+    COPY_FRAG: COPY_FRAG,
     EDGE_FRAG: EDGE_FRAG,
     AGG_FRAG: AGG_FRAG,
     COMP_FRAG: COMP_FRAG

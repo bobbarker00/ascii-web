@@ -48,6 +48,7 @@
 
     return {
       canvas: canvas,
+      chars: glyphs, // the actual characters, indexed like the strip
       glyphCount: glyphs.length,
       fillCount: FILL_RAMP.length,
       edgeBase: FILL_RAMP.length,

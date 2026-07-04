@@ -71,6 +71,11 @@ Load Temporary Add-on → pick `manifest.json`.
 - **DoG constants** — `SIGMA1`/`SIGMA2`/`DOG_THRESH` at the top of the blur
   shaders in `shaders.js`. Bigger sigma = only larger features get outlines;
   lower threshold = more lines.
+- **Text mode** — overlays become real, selectable `<pre>` characters
+  (monochrome) instead of a canvas, using ~1:2 cells to match monospace glyph
+  shape. Under the hood this is `renderer.readCells()`, which returns the cell
+  grid (chars + per-cell colours) as data — the same seam a terminal frontend
+  consumes.
 
 ## Known limitations (intentional, for v1)
 
@@ -97,11 +102,14 @@ Load Temporary Add-on → pick `manifest.json`.
 
 ## Next steps (good tasks to hand to Claude Code)
 
-- Add a "text mode" output that reads back the per-cell glyph indices and emits a
-  real, selectable `<pre>` of characters instead of a canvas.
+- Terminal frontend (`cli/`): headless Chrome via CDP, inject `src/glyph-atlas
+  .js`/`shaders.js`/`ascii-renderer.js`, feed page frames through
+  `readCells()`, emit ANSI. `content.js` stays extension-only.
+- Colour text mode (per-cell `<span>`s or CSS custom highlights — `readCells()`
+  already returns the colours).
 - Replace the per-cell pixel loop in the aggregate pass with mipmap sampling for
   the luminance average (cheaper at small cell sizes).
 - Add background-image and `<canvas>` capture.
 - Per-element enable/disable (click an image to toggle it) instead of all-or-none.
-- Persist a "fit characters to font aspect ratio" option (cells are square now;
-  real terminal cells are ~1:2).
+- Expose the cell aspect ratio as a setting for canvas mode too (text mode
+  already uses ~1:2; canvas cells are square).

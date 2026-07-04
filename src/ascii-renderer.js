@@ -75,6 +75,7 @@
     this.pEdge = program(gl, S.VERT, S.EDGE_FRAG);
     this.pAgg = program(gl, S.VERT, S.AGG_FRAG);
     this.pComp = program(gl, S.VERT, S.COMP_FRAG);
+    this.pCopy = program(gl, S.VERT, S.COPY_FRAG);
 
     // Half-float render targets keep the blur intermediates precise enough for
     // a clean DoG subtraction; fall back to 8-bit (slightly noisier lines) if
@@ -103,6 +104,7 @@
     this.dogFBO = null;  // (outW x outH) binary DoG line mask
     this.edgeFBO = null; // (outW x outH)
     this.cellsFBO = null; // (cols x rows)
+    this.colorFBO = null; // (cols x rows) source downsample, text-mode colour
   }
 
   AsciiRenderer.prototype._drawQuad = function () {
@@ -113,16 +115,20 @@
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   };
 
-  // sourceEl: an <img> or <video>. outW/outH: backing pixel size to render at.
-  // destCtx: a 2D context we blit the finished frame into.
-  AsciiRenderer.prototype.render = function (sourceEl, outW, outH, destCtx, opts) {
+  // Shared front half of both output modes: upload the source and run passes
+  // 1-4, leaving per-cell data in cellsFBO. Returns { cols, rows, outW, outH }
+  // or null if the upload tainted (cross-origin without CORS).
+  // opts.cellAspect (default 1) makes cells rectangular: text mode passes ~2
+  // so a cell matches the 1:2 shape of real monospace glyphs.
+  AsciiRenderer.prototype._prepare = function (sourceEl, outW, outH, opts) {
     const gl = this.gl;
     outW = Math.max(1, Math.floor(outW));
     outH = Math.max(1, Math.floor(outH));
 
-    const cellSize = Math.max(2, Math.min(24, opts.cellSize | 0));
-    const cols = Math.max(1, Math.floor(outW / cellSize));
-    const rows = Math.max(1, Math.floor(outH / cellSize));
+    const cellW = Math.max(2, Math.min(24, opts.cellSize | 0));
+    const cellH = Math.max(2, Math.min(32, Math.round(cellW * (opts.cellAspect || 1))));
+    const cols = Math.max(1, Math.floor(outW / cellW));
+    const rows = Math.max(1, Math.floor(outH / cellH));
 
     // (Re)allocate buffers if the size changed.
     if (this.canvas.width !== outW || this.canvas.height !== outH) {
@@ -136,6 +142,7 @@
     }
     if (!this.cellsFBO || this.cellsFBO.w !== cols || this.cellsFBO.h !== rows) {
       this.cellsFBO = makeFBO(gl, cols, rows, gl.NEAREST);
+      this.colorFBO = makeFBO(gl, cols, rows, gl.LINEAR);
     }
 
     // Upload the source frame.
@@ -194,9 +201,22 @@
     gl.bindTexture(gl.TEXTURE_2D, this.edgeFBO.tex);
     gl.uniform1i(gl.getUniformLocation(this.pAgg, 'u_edge'), 1);
     gl.uniform2f(gl.getUniformLocation(this.pAgg, 'u_outTexel'), 1 / outW, 1 / outH);
-    gl.uniform1f(gl.getUniformLocation(this.pAgg, 'u_cellSize'), cellSize);
+    gl.uniform2f(gl.getUniformLocation(this.pAgg, 'u_cellSize'), cellW, cellH);
     gl.uniform2f(gl.getUniformLocation(this.pAgg, 'u_grid'), cols, rows);
     this._drawQuad();
+
+    return { cols: cols, rows: rows, outW: outW, outH: outH };
+  };
+
+  // sourceEl: an <img>/<video>/ImageBitmap. outW/outH: backing pixel size to
+  // render at. destCtx: a 2D context we blit the finished frame into.
+  AsciiRenderer.prototype.render = function (sourceEl, outW, outH, destCtx, opts) {
+    const gl = this.gl;
+    const g = this._prepare(sourceEl, outW, outH, opts);
+    if (!g) return false;
+    const cols = g.cols, rows = g.rows;
+    outW = g.outW;
+    outH = g.outH;
 
     // ---- Pass 5: composite -> visible canvas ----
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -226,6 +246,72 @@
     destCtx.clearRect(0, 0, outW, outH);
     destCtx.drawImage(this.canvas, 0, 0);
     return true;
+  };
+
+  // Text-mode readback: run passes 1-4, then read the per-cell data back to
+  // the CPU instead of compositing pixels. This is the seam the terminal
+  // frontend consumes too — a cell grid is a terminal frame.
+  // Returns null on tainted upload, else:
+  //   cols, rows : grid dimensions
+  //   text       : the whole frame as chars, rows joined with '\n'
+  //   glyphs     : Uint8Array, glyph index per cell (indexes atlas.chars)
+  //   colors     : Uint8ClampedArray, r,g,b per cell (average source colour)
+  // Both arrays are row-major, top row first.
+  AsciiRenderer.prototype.readCells = function (sourceEl, outW, outH, opts) {
+    const gl = this.gl;
+    const g = this._prepare(sourceEl, outW, outH, opts);
+    if (!g) return null;
+    const cols = g.cols, rows = g.rows;
+
+    // Downsample the source to one colour per cell (same idea as COMP_FRAG
+    // sampling the source at the cell centre).
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.colorFBO.fbo);
+    gl.viewport(0, 0, cols, rows);
+    gl.useProgram(this.pCopy);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.srcTex);
+    gl.uniform1i(gl.getUniformLocation(this.pCopy, 'u_src'), 0);
+    this._drawQuad();
+
+    const cellBuf = new Uint8Array(cols * rows * 4);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.cellsFBO.fbo);
+    gl.readPixels(0, 0, cols, rows, gl.RGBA, gl.UNSIGNED_BYTE, cellBuf);
+    const colorBuf = new Uint8Array(cols * rows * 4);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.colorFBO.fbo);
+    gl.readPixels(0, 0, cols, rows, gl.RGBA, gl.UNSIGNED_BYTE, colorBuf);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+    // Mirror COMP_FRAG's glyph choice on the CPU.
+    const chars = this.atlas.chars;
+    const fillCount = this.atlas.fillCount;
+    const edgeBase = this.atlas.edgeBase;
+    const threshold = opts.edgeThreshold;
+    const glyphs = new Uint8Array(cols * rows);
+    const colors = new Uint8ClampedArray(cols * rows * 3);
+    const lines = new Array(rows);
+
+    for (let y = 0; y < rows; y++) {
+      const srcY = rows - 1 - y; // GL reads bottom-to-top; emit top-to-bottom
+      let line = '';
+      for (let x = 0; x < cols; x++) {
+        const i = (srcY * cols + x) * 4;
+        let idx;
+        if (cellBuf[i + 1] / 255 > threshold) {
+          idx = edgeBase + Math.round((cellBuf[i + 2] / 255) * 3);
+        } else {
+          idx = Math.min(fillCount - 1, Math.floor((cellBuf[i] / 255) * fillCount));
+        }
+        const o = y * cols + x;
+        glyphs[o] = idx;
+        line += chars[idx];
+        colors[o * 3] = colorBuf[i];
+        colors[o * 3 + 1] = colorBuf[i + 1];
+        colors[o * 3 + 2] = colorBuf[i + 2];
+      }
+      lines[y] = line;
+    }
+
+    return { cols: cols, rows: rows, text: lines.join('\n'), glyphs: glyphs, colors: colors };
   };
 
   NS.AsciiRenderer = AsciiRenderer;
