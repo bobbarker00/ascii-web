@@ -20,7 +20,12 @@
 //                      [--dog-thresh 0.015] [--fps 10]
 //                      [--mono] [--gray] [--invert] [--no-text] [--hidpi]
 //                      [--braille] [--pixels auto|kitty|sixel|off]
-//                      [--sound] [--once]
+//                      [--sound] [--gpu] [--diag] [--once]
+//
+// --diag: shows the GL renderer and per-frame costs in the status bar —
+//   "SwiftShader"/"llvmpipe" there means WebGL runs on the CPU, the usual
+//   cause of a slow machine. --gpu (experimental) asks headless Chrome to
+//   use the real GPU.
 //
 // --sigma / --dog-thresh: DoG edge tuning (same knobs as the extension's
 //   "Line scale" / "Line sensitivity" sliders). Bigger sigma = only larger
@@ -73,7 +78,8 @@ const argv = process.argv.slice(2);
 const opt = {
   cell: 8, threshold: 0.08, sigma: 1.2, dogThresh: 0.015, fps: 10,
   mono: false, gray: false, invert: false, noText: false, hidpi: false,
-  braille: false, sound: false, once: false, pixels: 'auto'
+  braille: false, sound: false, once: false, pixels: 'auto',
+  gpu: false, diag: false
 };
 let url = null;
 for (let i = 0; i < argv.length; i++) {
@@ -87,6 +93,8 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--sound') opt.sound = true;
   else if (a === '--once') opt.once = true;
   else if (a === '--pixels') opt.pixels = argv[++i] || 'auto';
+  else if (a === '--gpu') opt.gpu = true;
+  else if (a === '--diag') opt.diag = true;
   else if (a === '--cell') opt.cell = Math.max(2, Math.min(12, +argv[++i] || 8));
   else if (a === '--threshold') opt.threshold = +argv[++i] || 0.08;
   else if (a === '--sigma') opt.sigma = Math.max(0.4, Math.min(4, +argv[++i] || 1.2));
@@ -142,6 +150,7 @@ async function launch() {
     // without this.
     '--autoplay-policy=no-user-gesture-required'
   ];
+  if (opt.gpu) args.push('--enable-gpu'); // experimental: real GPU in headless
   if (!opt.sound) args.push('--mute-audio');
 
   // --sound needs headful Chrome (headless has no audio output path), but
@@ -289,6 +298,15 @@ const atlasInfo = await rendererPage.evaluate(() => {
   const a = window.__AsciiWeb.createAtlas(16);
   return { fillCount: a.fillCount, edgeBase: a.edgeBase };
 });
+
+// Which GL is actually running the pipeline (SwiftShader/llvmpipe = CPU).
+const glRenderer = await rendererPage.evaluate(() => {
+  const gl = window.__r.gl;
+  const ext = gl.getExtension('WEBGL_debug_renderer_info');
+  return String(ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER));
+});
+let shotMs = 0; // --diag frame timings
+let convMs = 0;
 
 // When the DOM text layer is on, hide the page's own text in the capture:
 // the edge detector otherwise fires on rendered glyphs, leaving "static"
@@ -899,7 +917,8 @@ function draw(f, scroll) {
       help = ' | q quit · o url · / find · f links · e type · H/L hist · ' +
         flag('t', !opt.noText) + ' ' + flag('i', opt.invert) + ' ' + flag('b', opt.braille) +
         ' ' + (pixelMode ? flag('p', pixelsOn) : 'p✗') + // ✗ = no kitty/sixel support detected
-        ' c:' + opt.colorMode + ' ';
+        ' c:' + opt.colorMode +
+        (opt.diag ? ' | ' + glRenderer.slice(0, 24) + ' s:' + shotMs + 'ms c:' + convMs + 'ms' : '') + ' ';
     }
     status = '\x1b[7m ' + url.slice(0, Math.max(10, grid.cols - help.length - 2)) +
       help + '\x1b[0m';
@@ -1023,11 +1042,18 @@ if (opt.once) {
   if (!opt.noText) await extractText();
   if (pixelMode) await extractMedia();
   const scroll = await page.evaluate(() => ({ sx: scrollX, sy: scrollY }));
+  const t1 = Date.now();
   const b64 = await page.screenshot({ type: 'jpeg', quality: 90, encoding: 'base64' });
+  const t2 = Date.now();
   const f = await convert(b64, scroll);
+  const t3 = Date.now();
   if (!f) { console.error('render failed'); await quit(1); }
   process.stdout.write(composeFrame(f, scroll).join('\n') + '\n');
   if (f.media && f.media.length) process.stdout.write(emitMedia(f.media));
+  if (opt.diag) {
+    process.stderr.write('gl: ' + glRenderer + '\nscreenshot: ' + (t2 - t1) +
+      'ms  convert: ' + (t3 - t2) + 'ms\n');
+  }
   await quit(0);
 }
 
@@ -1195,17 +1221,24 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Alt screen, hide cursor, clear, enable SGR mouse reporting.
 process.stdout.write('\x1b[?1049h\x1b[?25l\x1b[2J\x1b[?1000h\x1b[?1006h');
 
+let idleStreak = 0; // consecutive unchanged captures; slows the poll on idle pages
 while (!quitting) {
   const t0 = Date.now();
   try {
     const b64 = await page.screenshot({ type: 'jpeg', quality: 90, encoding: 'base64' });
+    shotMs = Date.now() - t0;
     if (b64 !== lastShot || force) {
+      idleStreak = 0;
       lastShot = b64;
       force = false;
       // Scroll first: media crop geometry depends on it.
       const scroll = await page.evaluate(() => ({ sx: scrollX, sy: scrollY }));
+      const t1 = Date.now();
       const f = await convert(b64, scroll);
+      convMs = Date.now() - t1;
       if (f && !quitting) draw(f, scroll);
+    } else {
+      idleStreak++;
     }
   } catch (e) {
     // Mid-navigation capture race; keep the last frame and try again.
@@ -1218,5 +1251,8 @@ while (!quitting) {
     if (!opt.noText) extractText().then(() => { if (mode === 'insert') redraw(); });
     if (pixelMode && pixelsOn) extractMedia();
   }
-  await sleep(Math.max(20, 1000 / opt.fps - (Date.now() - t0)));
+  // An idle page doesn't need fps-rate screenshot polling — back off after a
+  // few unchanged frames (any page change or keypress-forced redraw resets).
+  const interval = idleStreak > 5 ? Math.max(300, 1000 / opt.fps) : 1000 / opt.fps;
+  await sleep(Math.max(20, interval - (Date.now() - t0)));
 }
