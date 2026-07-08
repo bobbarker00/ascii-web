@@ -2,7 +2,9 @@
 
 A Manifest V3 browser extension that converts `<img>` and `<video>` elements on
 any page into live ASCII art, using a five-pass WebGL2 shader pipeline modelled
-on the AcerolaFX ASCII shader.
+on the [AcerolaFX](https://github.com/GarrettGunnell/AcerolaFX) ASCII shader
+(see Acknowledgements). A terminal-browser frontend (`cli/`) shares the same
+pipeline.
 
 This is a working starting scaffold, deliberately small and heavily commented so
 each piece is easy to understand and extend. It is **not** polished — see
@@ -144,6 +146,18 @@ node cli/ascii-browse.mjs https://en.wikipedia.org/wiki/ASCII_art
   served from an extensionless URL stays static; browsers without
   `ImageDecoder` (Firefox) fall back to a static first frame.
 - No overlay for CSS background images, `<canvas>`, or WebGL game canvases yet.
+
+## Acknowledgements
+
+The ASCII rendering approach — luminance mapped onto a fill-glyph ramp, plus
+Difference-of-Gaussians edge detection with directions quantized to `| - / \`
+line glyphs — comes from the ASCII effect in
+[AcerolaFX](https://github.com/GarrettGunnell/AcerolaFX) by Garrett "Acerola"
+Gunnell (MIT licensed), and from his video essay explaining it. This project
+is an independent WebGL2 implementation of that technique written from
+scratch for the browser; no AcerolaFX code was copied. If code is ever ported
+from that repo directly, its copyright notice must be carried along per the
+MIT license.
 
 ## Next steps (good tasks to hand to Claude Code)
 
