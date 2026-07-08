@@ -898,7 +898,8 @@ function draw(f, scroll) {
       const flag = (k, on) => k + (on ? '✓' : '·');
       help = ' | q quit · o url · / find · f links · e type · H/L hist · ' +
         flag('t', !opt.noText) + ' ' + flag('i', opt.invert) + ' ' + flag('b', opt.braille) +
-        (pixelMode ? ' ' + flag('p', pixelsOn) : '') + ' c:' + opt.colorMode + ' ';
+        ' ' + (pixelMode ? flag('p', pixelsOn) : 'p✗') + // ✗ = no kitty/sixel support detected
+        ' c:' + opt.colorMode + ' ';
     }
     status = '\x1b[7m ' + url.slice(0, Math.max(10, grid.cols - help.length - 2)) +
       help + '\x1b[0m';
