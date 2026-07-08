@@ -149,15 +149,11 @@ node cli/ascii-browse.mjs https://en.wikipedia.org/wiki/ASCII_art
 
 ## Acknowledgements
 
-The ASCII rendering approach — luminance mapped onto a fill-glyph ramp, plus
-Difference-of-Gaussians edge detection with directions quantized to `| - / \`
-line glyphs — comes from the ASCII effect in
-[AcerolaFX](https://github.com/GarrettGunnell/AcerolaFX) by Garrett "Acerola"
-Gunnell (MIT licensed), and from his video essay explaining it. This project
-is an independent WebGL2 implementation of that technique written from
-scratch for the browser; no AcerolaFX code was copied. If code is ever ported
-from that repo directly, its copyright notice must be carried along per the
-MIT license.
+The ASCII technique — a luminance fill ramp plus Difference-of-Gaussians
+edges quantized to `| - / \` glyphs — comes from Garrett "Acerola" Gunnell's
+[AcerolaFX](https://github.com/GarrettGunnell/AcerolaFX) and his video essay
+on it. This project is an independent WebGL2 implementation of that idea,
+built for the browser.
 
 ## Next steps (good tasks to hand to Claude Code)
 
