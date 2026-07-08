@@ -24,8 +24,10 @@
 //
 // --diag: shows the GL renderer and per-frame costs in the status bar —
 //   "SwiftShader"/"llvmpipe" there means WebGL runs on the CPU, the usual
-//   cause of a slow machine. --gpu (experimental) asks headless Chrome to
-//   use the real GPU.
+//   cause of a slow machine.
+// --gpu [vulkan|egl]: ask headless Chrome to use the real GPU. Bare --gpu
+//   works on NVIDIA; Intel/AMD Mesa setups usually need a backend spelled
+//   out — try "--gpu vulkan" first, then "--gpu egl". Verify with --diag.
 //
 // --sigma / --dog-thresh: DoG edge tuning (same knobs as the extension's
 //   "Line scale" / "Line sensitivity" sliders). Bigger sigma = only larger
@@ -93,7 +95,10 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--sound') opt.sound = true;
   else if (a === '--once') opt.once = true;
   else if (a === '--pixels') opt.pixels = argv[++i] || 'auto';
-  else if (a === '--gpu') opt.gpu = true;
+  else if (a === '--gpu') {
+    opt.gpu = true;
+    if (argv[i + 1] === 'vulkan' || argv[i + 1] === 'egl') opt.gpuMode = argv[++i];
+  }
   else if (a === '--diag') opt.diag = true;
   else if (a === '--cell') opt.cell = Math.max(2, Math.min(12, +argv[++i] || 8));
   else if (a === '--threshold') opt.threshold = +argv[++i] || 0.08;
@@ -150,7 +155,16 @@ async function launch() {
     // without this.
     '--autoplay-policy=no-user-gesture-required'
   ];
-  if (opt.gpu) args.push('--enable-gpu'); // experimental: real GPU in headless
+  if (opt.gpu) {
+    // Real GPU in headless. Bare --enable-gpu suffices on NVIDIA; Mesa
+    // (Intel/AMD) usually needs the backend named explicitly.
+    args.push('--enable-gpu', '--ignore-gpu-blocklist');
+    if (opt.gpuMode === 'vulkan') {
+      args.push('--use-angle=vulkan', '--enable-features=Vulkan,DefaultANGLEVulkan,VulkanFromANGLE');
+    } else if (opt.gpuMode === 'egl') {
+      args.push('--use-angle=gl-egl');
+    }
+  }
   if (!opt.sound) args.push('--mute-audio');
 
   // --sound needs headful Chrome (headless has no audio output path), but
@@ -240,8 +254,20 @@ const rendererPage = await browser.newPage();
 for (const f of PIPELINE_FILES) {
   await rendererPage.addScriptTag({ content: readFileSync(join(SRC_DIR, f), 'utf8') });
 }
+try {
+  await rendererPage.evaluate(() => {
+    window.__r = new window.__AsciiWeb.AsciiRenderer(); // throws if WebGL2 missing
+  });
+} catch (e) {
+  process.stderr.write('renderer init failed: ' + e.message.split('\n')[0] + '\n');
+  if (opt.gpu) {
+    process.stderr.write('The requested GPU backend killed WebGL2 (forcing a backend also disables\n' +
+      'the software fallback). Try: --gpu vulkan, --gpu egl, plain --gpu, or drop\n' +
+      '--gpu entirely for software rendering. --diag shows which GL you got.\n');
+  }
+  await quit(1);
+}
 await rendererPage.evaluate(() => {
-  window.__r = new window.__AsciiWeb.AsciiRenderer(); // throws if WebGL2 missing
 
   // Sixel encoder (fixed 6x6x6 palette, RLE). Lives in the renderer tab so
   // the heavy per-pixel work happens in the browser process, not our loop.
